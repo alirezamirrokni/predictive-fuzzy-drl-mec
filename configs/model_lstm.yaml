@@ -1,0 +1,7 @@
+phase: future
+model: lstm
+lookback_window: 10
+prediction_horizon: 1
+hidden_size: 64
+num_layers: 2
+dropout: 0.2
