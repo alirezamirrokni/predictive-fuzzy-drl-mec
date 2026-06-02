@@ -1,0 +1,13 @@
+top_k: 5
+include_fuzzy_weights: true
+prediction_uncertainty: 0.0
+max_episode_tasks: 400
+reward:
+  latency_normalizer: 10.0
+  energy_normalizer: 10.0
+  deadline_penalty: 1.0
+  failure_penalty: 1.0
+  battery_penalty: 0.5
+  channel_penalty: 0.5
+  server_penalty: 0.5
+  reward_clip: 10.0

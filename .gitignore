@@ -1,8 +1,14 @@
-.venv/
 __pycache__/
-.pytest_cache/
 *.pyc
+.pytest_cache/
+.venv/
+.env
 .DS_Store
+data/generated/*.npz
+data/generated/checkpoints/
 data/results/*.csv
 data/results/*.json
+!data/generated/.gitkeep
+!data/results/.gitkeep
 reports/figures/*.png
+reports/figures/*.pdf
