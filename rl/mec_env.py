@@ -16,6 +16,7 @@ from mec.device import IoTDevice
 from mec.server import EdgeServer
 from mec.simulator import MECSimulator, OffloadingDecision, build_simulator_from_config, load_yaml_config
 from mec.task import Task
+from predictors.runtime import PredictiveConfig, PredictiveFeatureProvider, PredictiveSnapshot
 from .candidate_selector import CandidateSelector, CandidateSelectorConfig
 from .reward import MECRewardFunction, RewardConfig
 
@@ -26,6 +27,20 @@ class MECEnvConfig:
     include_fuzzy_weights: bool = True
     prediction_uncertainty: float = 0.0
     max_episode_tasks: Optional[int] = None
+    predictor_type: str = "none"
+    predictor_checkpoint_path: str = ""
+    predictor_model_config_path: str = ""
+    include_prediction: bool = True
+    predictive_feature_size: int = 10
+    prediction_fallback_uncertainty: float = 0.5
+    device: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object] | None) -> "MECEnvConfig":
+        if not data:
+            return cls()
+        fields = cls.__dataclass_fields__
+        return cls(**{key: value for key, value in data.items() if key in fields})
 
 
 class MECOffloadingEnv(gym.Env):
@@ -43,15 +58,32 @@ class MECOffloadingEnv(gym.Env):
         self.selector = CandidateSelector(CandidateSelectorConfig(top_k=self.env_config.top_k))
         self.fuzzy_controller = FuzzyController()
         self.reward_function = MECRewardFunction(self.fuzzy_controller, reward_config)
+        self.predictor = PredictiveFeatureProvider(
+            PredictiveConfig(
+                predictor_type=self.env_config.predictor_type,
+                checkpoint_path=self.env_config.predictor_checkpoint_path,
+                model_config_path=self.env_config.predictor_model_config_path,
+                feature_size=self.env_config.predictive_feature_size,
+                fallback_uncertainty=self.env_config.prediction_fallback_uncertainty,
+                device=self.env_config.device,
+            )
+        )
         self.partial_ratios = [0.25, 0.5, 0.75, 1.0]
         self.action_space = spaces.MultiDiscrete([3, self.env_config.top_k, len(self.partial_ratios)])
-        self.observation_dim = 6 + 7 + self.env_config.top_k * 9 + (4 if self.env_config.include_fuzzy_weights else 0)
+        self.observation_dim = (
+            6
+            + 7
+            + self.env_config.top_k * 9
+            + (self.env_config.predictive_feature_size if self.env_config.include_prediction else 0)
+            + (4 if self.env_config.include_fuzzy_weights else 0)
+        )
         self.observation_space = spaces.Box(low=0.0, high=5.0, shape=(self.observation_dim,), dtype=np.float32)
         self.simulator: MECSimulator | None = None
         self.tasks: List[Task] = []
         self.current_index = 0
         self.current_time = 0
         self.last_info: Dict[str, Any] = {}
+        self.last_prediction: PredictiveSnapshot | None = None
 
     def _load_config(self) -> Dict[str, Any]:
         if isinstance(self.scenario_config_source, dict):
@@ -70,6 +102,9 @@ class MECOffloadingEnv(gym.Env):
         self.current_index = 0
         self.current_time = 0
         self.last_info = {}
+        self.predictor.reset()
+        self.predictor.observe(self.simulator, ready_task_rate=0.0)
+        self.last_prediction = self.predictor.predict(self.simulator)
 
     def reset(self, *, seed: int | None = None, options: Dict[str, Any] | None = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
@@ -85,9 +120,11 @@ class MECOffloadingEnv(gym.Env):
         device = self.simulator.device_index[task.device_id]
         self._advance_to(task.arrival_time)
         candidates = self._current_candidates(task, device)
+        prediction = self.predictor.predict(self.simulator)
+        uncertainty = self._effective_prediction_uncertainty(prediction)
         decision = self._decode_action(action, candidates)
         outcome = self.simulator.apply(self.current_time, task, device, decision)
-        reward, reward_info = self.reward_function.compute(outcome, task, device, candidates, self.env_config.prediction_uncertainty)
+        reward, reward_info = self.reward_function.compute(outcome, task, device, candidates, uncertainty)
         self.current_index += 1
         terminated = self.current_index >= len(self.tasks)
         observation = self._zero_observation() if terminated else self._observation()
@@ -102,6 +139,9 @@ class MECOffloadingEnv(gym.Env):
             "reliability": outcome.reliability,
             "success": outcome.success,
             "deadline_violation": outcome.deadline_violation,
+            "prediction_source": prediction.source,
+            "prediction_available": prediction.available,
+            "prediction_uncertainty": uncertainty,
             **reward_info,
         }
         self.last_info = info
@@ -111,11 +151,22 @@ class MECOffloadingEnv(gym.Env):
         if self.simulator is None:
             return
         while self.current_time < target_time:
+            ready_count = sum(1 for task in self.tasks[self.current_index :] if task.arrival_time == self.current_time)
             for server in self.simulator.servers:
                 server.process_slot(self.simulator.slot_duration_s)
             for device in self.simulator.devices:
                 self.simulator.mobility.update(device, self.simulator.rng, self.simulator.slot_duration_s)
+            rate = ready_count / max(1, len(self.simulator.devices))
+            self.predictor.observe(self.simulator, ready_task_rate=rate)
             self.current_time += 1
+
+    def _effective_prediction_uncertainty(self, prediction: PredictiveSnapshot | None = None) -> float:
+        if prediction is None:
+            if self.simulator is None:
+                return float(self.env_config.prediction_uncertainty)
+            prediction = self.predictor.predict(self.simulator)
+        configured = float(self.env_config.prediction_uncertainty)
+        return max(0.0, min(1.0, max(configured, float(prediction.uncertainty))))
 
     def _decode_action(self, action: np.ndarray | List[int] | Tuple[int, ...], candidates: List[EdgeServer]) -> OffloadingDecision:
         values = np.asarray(action, dtype=np.int64).reshape(-1)
@@ -150,13 +201,18 @@ class MECOffloadingEnv(gym.Env):
             return self._zero_observation()
         task, device = self._current_task()
         candidates = self._current_candidates(task, device)
+        prediction = self.predictor.predict(self.simulator)
+        self.last_prediction = prediction
+        uncertainty = self._effective_prediction_uncertainty(prediction)
         values: List[float] = []
         values.extend(self._task_features(task))
         values.extend(self._device_features(device))
         for server in candidates:
             values.extend(self._server_features(server, device))
+        if self.env_config.include_prediction:
+            values.extend(prediction.vector[: self.env_config.predictive_feature_size].tolist())
         if self.env_config.include_fuzzy_weights:
-            weights = self.fuzzy_controller.compute_from_task_context(task, device, candidates, self.env_config.prediction_uncertainty).to_dict()
+            weights = self.fuzzy_controller.compute_from_task_context(task, device, candidates, uncertainty).to_dict()
             values.extend([weights["energy"], weights["latency"], weights["success"], weights["reliability"]])
         arr = np.asarray(values, dtype=np.float32)
         if arr.shape[0] != self.observation_dim:
@@ -167,10 +223,7 @@ class MECOffloadingEnv(gym.Env):
         return np.zeros((self.observation_dim,), dtype=np.float32)
 
     def _task_features(self, task: Task) -> List[float]:
-        if self.simulator is None:
-            max_time = 1.0
-        else:
-            max_time = max(1.0, float(self.simulator.time_slots))
+        max_time = 1.0 if self.simulator is None else max(1.0, float(self.simulator.time_slots))
         return [
             task.data_size_mb / 10.0,
             task.output_size_mb / 2.0,

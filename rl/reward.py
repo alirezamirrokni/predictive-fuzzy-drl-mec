@@ -20,6 +20,18 @@ class RewardConfig:
     channel_penalty: float = 0.5
     server_penalty: float = 0.5
     reward_clip: float = 10.0
+    use_static_weights: bool = False
+    static_energy_weight: float = 0.25
+    static_latency_weight: float = 0.25
+    static_success_weight: float = 0.25
+    static_reliability_weight: float = 0.25
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object] | None) -> "RewardConfig":
+        if not data:
+            return cls()
+        fields = cls.__dataclass_fields__
+        return cls(**{key: value for key, value in data.items() if key in fields})
 
 
 class MECRewardFunction:
@@ -28,6 +40,13 @@ class MECRewardFunction:
         self.config = RewardConfig() if config is None else config
 
     def weights_for(self, task: Task, device: IoTDevice, candidate_servers: Iterable[EdgeServer], prediction_uncertainty: float = 0.0) -> FuzzyWeights:
+        if self.config.use_static_weights:
+            return FuzzyWeights(
+                energy=float(self.config.static_energy_weight),
+                latency=float(self.config.static_latency_weight),
+                success=float(self.config.static_success_weight),
+                reliability=float(self.config.static_reliability_weight),
+            ).normalized()
         return self.fuzzy_controller.compute_from_task_context(task, device, candidate_servers, prediction_uncertainty)
 
     def compute(

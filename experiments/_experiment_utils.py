@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List
+
+from main import run as run_heuristic
+
+
+DRL_METHODS = {
+    "no_prediction_drl": {
+        "predictor_type": "none",
+        "checkpoint": "data/generated/checkpoints/no_prediction_drl.pt",
+        "extra_train": ["--no-prediction"],
+        "extra_eval": ["--no-prediction"],
+    },
+    "static_weight_drl": {
+        "predictor_type": "none",
+        "checkpoint": "data/generated/checkpoints/static_weight_drl.pt",
+        "extra_train": ["--static-weights", "--no-prediction"],
+        "extra_eval": ["--static-weights", "--no-prediction"],
+    },
+    "lstm_fuzzy_drl": {
+        "predictor_type": "lstm",
+        "checkpoint": "data/generated/checkpoints/lstm_fuzzy_drl.pt",
+        "predictor_checkpoint": "data/generated/checkpoints/lstm_best.pt",
+        "predictor_config": "configs/model_lstm.yaml",
+        "extra_train": [],
+        "extra_eval": [],
+    },
+    "gnn_fuzzy_drl": {
+        "predictor_type": "gnn",
+        "checkpoint": "data/generated/checkpoints/gnn_fuzzy_drl.pt",
+        "predictor_checkpoint": "data/generated/checkpoints/gnn_best.pt",
+        "predictor_config": "configs/model_gnn.yaml",
+        "extra_train": [],
+        "extra_eval": [],
+    },
+}
+
+
+def call(args: List[str]) -> None:
+    print("RUN", " ".join(args))
+    subprocess.run(args, check=True)
+
+
+def run_heuristics(config_path: str, output_dir: str, policies: Iterable[str] = ("local_only", "random", "greedy_latency", "greedy_energy")) -> None:
+    for policy in policies:
+        run_heuristic(config_path, policy, output_dir)
+
+
+def maybe_train_predictor(kind: str, scenario_config: str, force: bool = False) -> None:
+    if kind == "lstm":
+        checkpoint = Path("data/generated/checkpoints/lstm_best.pt")
+        if force or not checkpoint.exists():
+            call([sys.executable, "-m", "predictors.train_lstm", "--scenario-config", scenario_config, "--restart"])
+    elif kind == "gnn":
+        checkpoint = Path("data/generated/checkpoints/gnn_best.pt")
+        if force or not checkpoint.exists():
+            call([sys.executable, "-m", "predictors.train_gnn", "--scenario-config", scenario_config, "--restart"])
+
+
+def train_drl_method(method: str, scenario_config: str, output_dir: str, total_timesteps: int, max_episode_tasks: int | None, force: bool = False) -> Path:
+    spec = DRL_METHODS[method]
+    checkpoint = Path(spec["checkpoint"])
+    if checkpoint.exists() and not force:
+        return checkpoint
+    args = [
+        sys.executable,
+        "-m",
+        "rl.train_ppo",
+        "--scenario-config",
+        scenario_config,
+        "--checkpoint-path",
+        str(checkpoint),
+        "--log-path",
+        str(Path(output_dir) / f"{method}_train_log.csv"),
+        "--result-path",
+        str(Path(output_dir) / f"{method}_train_summary.json"),
+        "--total-timesteps",
+        str(int(total_timesteps)),
+    ]
+    if max_episode_tasks is not None:
+        args += ["--max-episode-tasks", str(int(max_episode_tasks))]
+    if spec.get("predictor_type"):
+        args += ["--predictor-type", spec["predictor_type"]]
+    if spec.get("predictor_checkpoint"):
+        args += ["--predictor-checkpoint-path", spec["predictor_checkpoint"]]
+    if spec.get("predictor_config"):
+        args += ["--predictor-model-config-path", spec["predictor_config"]]
+    args += list(spec.get("extra_train", []))
+    call(args)
+    return checkpoint
+
+
+def evaluate_drl_method(method: str, scenario_config: str, output_dir: str, episodes: int, max_episode_tasks: int | None) -> None:
+    spec = DRL_METHODS[method]
+    checkpoint = Path(spec["checkpoint"])
+    if not checkpoint.exists():
+        print(f"SKIP {method}: checkpoint does not exist: {checkpoint}")
+        return
+    args = [
+        sys.executable,
+        "-m",
+        "rl.evaluate_policy",
+        "--policy",
+        "ppo",
+        "--scenario-config",
+        scenario_config,
+        "--checkpoint-path",
+        str(checkpoint),
+        "--output",
+        str(Path(output_dir) / f"{method}_eval.json"),
+        "--metrics-csv",
+        str(Path(output_dir) / f"{method}_metrics.csv"),
+        "--episodes",
+        str(int(episodes)),
+        "--deterministic",
+    ]
+    if max_episode_tasks is not None:
+        args += ["--max-episode-tasks", str(int(max_episode_tasks))]
+    if spec.get("predictor_type"):
+        args += ["--predictor-type", spec["predictor_type"]]
+    if spec.get("predictor_checkpoint"):
+        args += ["--predictor-checkpoint-path", spec["predictor_checkpoint"]]
+    if spec.get("predictor_config"):
+        args += ["--predictor-model-config-path", spec["predictor_config"]]
+    args += list(spec.get("extra_eval", []))
+    call(args)
+
+
+def collect_json_summaries(output_dir: str, destination: str) -> Dict[str, object]:
+    output = Path(output_dir)
+    summaries = {}
+    for path in sorted(output.glob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                summaries[path.stem] = json.load(file)
+        except Exception:
+            pass
+    destination_path = Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    with destination_path.open("w", encoding="utf-8") as file:
+        json.dump(summaries, file, indent=2)
+    return summaries
