@@ -17,14 +17,15 @@ def main() -> None:
     parser.add_argument("--total-timesteps", type=int, default=10000)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-episode-tasks", type=int, default=2000)
+    parser.add_argument("--predictor-epochs", type=int, default=None)
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     if not args.skip_heuristics:
         run_heuristics(args.config, args.output_dir)
     if not args.skip_drl:
         if args.train_predictors:
-            maybe_train_predictor("lstm", args.config, args.force_train)
-            maybe_train_predictor("gnn", args.config, args.force_train)
+            maybe_train_predictor("lstm", args.config, args.force_train, args.predictor_epochs)
+            maybe_train_predictor("gnn", args.config, args.force_train, args.predictor_epochs)
         for method in ["no_prediction_drl", "static_weight_drl", "lstm_fuzzy_drl", "gnn_fuzzy_drl"]:
             train_drl_method(method, args.config, args.output_dir, args.total_timesteps, args.max_episode_tasks, args.force_train)
             evaluate_drl_method(method, args.config, args.output_dir, args.episodes, args.max_episode_tasks)

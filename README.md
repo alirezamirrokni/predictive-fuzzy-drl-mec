@@ -142,3 +142,23 @@ PYTHONPATH=. python -m experiments.run_full_pipeline --scenario both --train-pre
 ```
 
 For quick debugging, reduce `--total-timesteps` and `--max-episode-tasks`.
+
+## Added completion notes
+
+This completed version adds:
+
+- fixed YAML loading for scenario files
+- scenario configurations for `scenario_a_600`, `scenario_a_1000`, `scenario_b_30`, and `scenario_b_100`
+- a centralized `configs/rasoul_reference.yaml` for MEC/RASOUL-style variables
+- per-task task-specification logging in every metrics CSV
+- per-task execution overhead logging until task exit: transmission, reception, and queue delay
+- online runtime overhead logging for predictor, fuzzy reward, simulator apply, policy, and DRL action inference
+- learning overhead summaries in task-equivalent steps
+- separate plotting commands for energy, latency, success ratio, reliability, task specifications, and overhead
+
+Full Colab commands are in [`COLAB_COMMANDS.md`](COLAB_COMMANDS.md). A shortcut script is available:
+
+```bash
+bash scripts/run_colab_project.sh configs/scenario_a_600.yaml data/results/scenario_a_600 10 2000 2000 3
+bash scripts/run_colab_project.sh configs/scenario_b_30.yaml data/results/scenario_b_30 10 2000 2000 3
+```

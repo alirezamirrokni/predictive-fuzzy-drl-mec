@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, List
 
 import numpy as np
@@ -40,6 +41,8 @@ def summarize(step_rows: List[Dict[str, Any]], total_rewards: List[float]) -> Di
     energies = [float(row.get("energy_j", 0.0)) for row in step_rows]
     reliabilities = [float(row.get("reliability", 0.0)) for row in step_rows]
     deadline_violations = [float(row.get("deadline_violation", 0.0)) for row in step_rows]
+    execution_overheads = [float(row.get("execution_overhead_s", 0.0)) for row in step_rows]
+    online_overheads = [float(row.get("online_overhead_s", 0.0)) for row in step_rows]
     return {
         "episodes": float(len(total_rewards)),
         "tasks": float(len(step_rows)),
@@ -49,6 +52,9 @@ def summarize(step_rows: List[Dict[str, Any]], total_rewards: List[float]) -> Di
         "average_energy_j": float(np.mean(energies)) if energies else 0.0,
         "average_reliability": float(np.mean(reliabilities)) if reliabilities else 0.0,
         "deadline_violation_rate": float(np.mean(deadline_violations)) if deadline_violations else 0.0,
+        "average_execution_overhead_s": float(np.mean(execution_overheads)) if execution_overheads else 0.0,
+        "average_online_overhead_s": float(np.mean(online_overheads)) if online_overheads else 0.0,
+        "total_online_overhead_s": float(np.sum(online_overheads)) if online_overheads else 0.0,
     }
 
 
@@ -71,6 +77,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, Any]:
         episode_reward = 0.0
         rng = np.random.default_rng(int(args.seed) + episode)
         while not done:
+            action_start = perf_counter()
             if args.policy == "random":
                 action = env.action_space.sample()
             else:
@@ -78,6 +85,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, Any]:
                     obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     action_tensor, _, _, _ = model.get_action_and_value(obs_tensor, deterministic=bool(args.deterministic))
                     action = action_tensor.squeeze(0).detach().cpu().numpy()
+            policy_inference_overhead_s = perf_counter() - action_start
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             episode_reward += float(reward)
@@ -85,6 +93,9 @@ def evaluate(args: argparse.Namespace) -> Dict[str, Any]:
                 row = dict(info)
                 row["episode"] = episode
                 row["step_reward"] = float(reward)
+                row["drl_overhead_s"] = policy_inference_overhead_s if args.policy == "ppo" else 0.0
+                row["policy_overhead_s"] = policy_inference_overhead_s
+                row["online_overhead_s"] = float(row.get("online_overhead_s", 0.0)) + policy_inference_overhead_s
                 step_rows.append(row)
         total_rewards.append(episode_reward)
         if env.simulator is not None:

@@ -24,6 +24,24 @@ class MetricRecord:
     failed_due_to_battery: int
     failed_due_to_channel: int
     failed_due_to_server: int
+    data_size_mb: float = 0.0
+    output_size_mb: float = 0.0
+    cpu_cycles_mi: float = 0.0
+    deadline_s: float = 0.0
+    priority: int = 0
+    arrival_time: int = 0
+    tx_time_s: float = 0.0
+    rx_time_s: float = 0.0
+    queue_delay_s: float = 0.0
+    edge_compute_time_s: float = 0.0
+    local_compute_time_s: float = 0.0
+    execution_overhead_s: float = 0.0
+    policy_overhead_s: float = 0.0
+    prediction_overhead_s: float = 0.0
+    fuzzy_overhead_s: float = 0.0
+    drl_overhead_s: float = 0.0
+    simulator_apply_overhead_s: float = 0.0
+    online_overhead_s: float = 0.0
 
 
 class MetricsLogger:
@@ -48,6 +66,9 @@ class MetricsLogger:
                 "local_ratio": 0.0,
                 "edge_ratio": 0.0,
                 "partial_ratio": 0.0,
+                "average_execution_overhead_s": 0.0,
+                "average_online_overhead_s": 0.0,
+                "total_online_overhead_s": 0.0,
             }
         n = len(self.records)
         return {
@@ -63,6 +84,9 @@ class MetricsLogger:
             "local_ratio": sum(r.mode == "local" for r in self.records) / n,
             "edge_ratio": sum(r.mode == "edge" for r in self.records) / n,
             "partial_ratio": sum(r.mode == "partial" for r in self.records) / n,
+            "average_execution_overhead_s": mean(r.execution_overhead_s for r in self.records),
+            "average_online_overhead_s": mean(r.online_overhead_s for r in self.records),
+            "total_online_overhead_s": sum(r.online_overhead_s for r in self.records),
         }
 
     def to_csv(self, path: str | Path) -> None:

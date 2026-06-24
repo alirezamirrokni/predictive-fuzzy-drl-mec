@@ -1,5 +1,5 @@
-seed: 84
-scenario_name: scenario_b_30
+seed: 85
+scenario_name: scenario_b_100
 simulation:
   time_slots: 200
   slot_duration_s: 1.0
@@ -15,7 +15,7 @@ devices:
   mobility_speed_mps: [0.0, 1.5]
   failure_probability: [0.001, 0.01]
 servers:
-  count: 30
+  count: 100
   cpu_capacity_mips: [8000.0, 30000.0]
   bandwidth_mhz: [10.0, 50.0]
   failure_probability: [0.001, 0.03]

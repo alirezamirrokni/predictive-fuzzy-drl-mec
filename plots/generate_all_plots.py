@@ -9,6 +9,8 @@ from plots.plot_latency import plot as plot_latency
 from plots.plot_reliability import plot as plot_reliability
 from plots.plot_success import plot as plot_success
 from plots.plot_task_stats import plot as plot_task_stats
+from plots.plot_task_specs import plot as plot_task_specs
+from plots.plot_overhead import generate as generate_overhead
 
 
 def main() -> None:
@@ -27,8 +29,10 @@ def main() -> None:
             plot_reliability(str(csv_path), str(out_dir / f"{stem}_reliability.png"))
             plot_success(str(csv_path), str(out_dir / f"{stem}_success.png"))
             plot_task_stats(str(csv_path), str(out_dir / f"{stem}_task_modes.png"))
+            plot_task_specs(str(csv_path), str(out_dir / "task_specs"))
         except Exception as exc:
             print(f"skip {csv_path}: {exc}")
+    generate_overhead(str(results), str(figures))
     for directory in [item for item in results.rglob("*") if item.is_dir()] + [results]:
         if list(directory.glob("*.json")):
             try:

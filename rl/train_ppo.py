@@ -196,6 +196,8 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "predictor_type": env.env_config.predictor_type,
         "include_fuzzy_weights": env.env_config.include_fuzzy_weights,
         "include_prediction": env.env_config.include_prediction,
+        "learning_task_equivalent": int(global_step),
+        "max_episode_tasks": env.env_config.max_episode_tasks if env.env_config.max_episode_tasks is not None else 0,
     }
     save_ppo_checkpoint(args.checkpoint_path, model, metadata)
     env.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -50,6 +51,16 @@ class SimulationOutcome:
     failed_due_to_battery: bool
     failed_due_to_channel: bool
     failed_due_to_server: bool
+    tx_time_s: float = 0.0
+    rx_time_s: float = 0.0
+    queue_delay_s: float = 0.0
+    edge_compute_time_s: float = 0.0
+    local_compute_time_s: float = 0.0
+
+    @property
+    def execution_overhead_s(self) -> float:
+        """Non-compute communication/queueing overhead until the task leaves the system."""
+        return float(self.tx_time_s + self.rx_time_s + self.queue_delay_s)
 
 
 class MECSimulator:
@@ -92,14 +103,29 @@ class MECSimulator:
             return self._estimate_remote(task, device, server, 1.0)
         return self._estimate_partial(task, device, server, float(decision.partial_ratio))
 
-    def apply(self, time_slot: int, task: Task, device: IoTDevice, decision: OffloadingDecision) -> SimulationOutcome:
+    def apply(
+        self,
+        time_slot: int,
+        task: Task,
+        device: IoTDevice,
+        decision: OffloadingDecision,
+        policy_overhead_s: float = 0.0,
+        prediction_overhead_s: float = 0.0,
+        fuzzy_overhead_s: float = 0.0,
+        drl_overhead_s: float = 0.0,
+        online_overhead_s: float = 0.0,
+    ) -> SimulationOutcome:
         decision = decision.normalized()
+        apply_start = perf_counter()
         outcome = self.estimate(task, device, decision)
         outcome = self._sample_failures(task, device, decision, outcome)
         device.consume_energy(outcome.energy_j)
         if decision.mode in {"edge", "partial"} and decision.server_id is not None:
             server = self.server_by_id(decision.server_id)
             server.add_workload(task.cpu_cycles_mi * decision.partial_ratio)
+        simulator_apply_overhead_s = perf_counter() - apply_start
+        if online_overhead_s <= 0.0:
+            online_overhead_s = policy_overhead_s + prediction_overhead_s + fuzzy_overhead_s + drl_overhead_s + simulator_apply_overhead_s
         self.metrics.log(
             MetricRecord(
                 time_slot=time_slot,
@@ -116,6 +142,24 @@ class MECSimulator:
                 failed_due_to_battery=int(outcome.failed_due_to_battery),
                 failed_due_to_channel=int(outcome.failed_due_to_channel),
                 failed_due_to_server=int(outcome.failed_due_to_server),
+                data_size_mb=task.data_size_mb,
+                output_size_mb=task.output_size_mb,
+                cpu_cycles_mi=task.cpu_cycles_mi,
+                deadline_s=task.deadline_s,
+                priority=task.priority,
+                arrival_time=task.arrival_time,
+                tx_time_s=outcome.tx_time_s,
+                rx_time_s=outcome.rx_time_s,
+                queue_delay_s=outcome.queue_delay_s,
+                edge_compute_time_s=outcome.edge_compute_time_s,
+                local_compute_time_s=outcome.local_compute_time_s,
+                execution_overhead_s=outcome.execution_overhead_s,
+                policy_overhead_s=policy_overhead_s,
+                prediction_overhead_s=prediction_overhead_s,
+                fuzzy_overhead_s=fuzzy_overhead_s,
+                drl_overhead_s=drl_overhead_s,
+                simulator_apply_overhead_s=simulator_apply_overhead_s,
+                online_overhead_s=online_overhead_s,
             )
         )
         return outcome
@@ -129,8 +173,10 @@ class MECSimulator:
             for device in self.devices:
                 ready_tasks = device.pop_ready_tasks(time_slot)
                 for task in ready_tasks:
+                    policy_start = perf_counter()
                     decision = policy.choose(self, task, device)
-                    self.apply(time_slot, task, device, decision)
+                    policy_overhead_s = perf_counter() - policy_start
+                    self.apply(time_slot, task, device, decision, policy_overhead_s=policy_overhead_s)
         remaining = []
         for device in self.devices:
             remaining.extend(device.task_queue)
@@ -139,8 +185,10 @@ class MECSimulator:
             last_slot = max(0, self.time_slots - 1)
             for task in remaining:
                 device = self.device_index[task.device_id]
+                policy_start = perf_counter()
                 decision = policy.choose(self, task, device)
-                self.apply(last_slot, task, device, decision)
+                policy_overhead_s = perf_counter() - policy_start
+                self.apply(last_slot, task, device, decision, policy_overhead_s=policy_overhead_s)
         return self.metrics
 
     def candidate_servers(self, device: IoTDevice, top_k: Optional[int] = None) -> List[EdgeServer]:
@@ -181,6 +229,7 @@ class MECSimulator:
             failed_due_to_battery=failed_battery,
             failed_due_to_channel=False,
             failed_due_to_server=False,
+            local_compute_time_s=local_time,
         )
 
     def _sample_failures(self, task: Task, device: IoTDevice, decision: OffloadingDecision, outcome: SimulationOutcome) -> SimulationOutcome:
@@ -205,6 +254,11 @@ class MECSimulator:
             failed_due_to_battery=outcome.failed_due_to_battery,
             failed_due_to_channel=failed_channel,
             failed_due_to_server=failed_server or failed_device,
+            tx_time_s=outcome.tx_time_s,
+            rx_time_s=outcome.rx_time_s,
+            queue_delay_s=outcome.queue_delay_s,
+            edge_compute_time_s=outcome.edge_compute_time_s,
+            local_compute_time_s=outcome.local_compute_time_s,
         )
 
     def _estimate_remote(self, task: Task, device: IoTDevice, server: EdgeServer, ratio: float) -> SimulationOutcome:
@@ -229,6 +283,10 @@ class MECSimulator:
             failed_due_to_battery=failed_battery,
             failed_due_to_channel=False,
             failed_due_to_server=False,
+            tx_time_s=tx_time,
+            rx_time_s=rx_time,
+            queue_delay_s=queue_delay,
+            edge_compute_time_s=compute_time,
         )
 
     def _estimate_partial(self, task: Task, device: IoTDevice, server: EdgeServer, ratio: float) -> SimulationOutcome:
@@ -252,6 +310,11 @@ class MECSimulator:
             failed_due_to_battery=failed_battery,
             failed_due_to_channel=remote.failed_due_to_channel,
             failed_due_to_server=remote.failed_due_to_server,
+            tx_time_s=remote.tx_time_s,
+            rx_time_s=remote.rx_time_s,
+            queue_delay_s=remote.queue_delay_s,
+            edge_compute_time_s=remote.edge_compute_time_s,
+            local_compute_time_s=local_time,
         )
 
 

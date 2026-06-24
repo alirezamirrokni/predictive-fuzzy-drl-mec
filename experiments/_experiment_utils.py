@@ -1,45 +1,56 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List
 
 from main import run as run_heuristic
+from mec.simulator import load_yaml_config
 
 
 DRL_METHODS = {
     "no_prediction_drl": {
         "predictor_type": "none",
-        "checkpoint": "data/generated/checkpoints/no_prediction_drl.pt",
         "extra_train": ["--no-prediction"],
         "extra_eval": ["--no-prediction"],
     },
     "static_weight_drl": {
         "predictor_type": "none",
-        "checkpoint": "data/generated/checkpoints/static_weight_drl.pt",
         "extra_train": ["--static-weights", "--no-prediction"],
         "extra_eval": ["--static-weights", "--no-prediction"],
     },
     "lstm_fuzzy_drl": {
         "predictor_type": "lstm",
-        "checkpoint": "data/generated/checkpoints/lstm_fuzzy_drl.pt",
-        "predictor_checkpoint": "data/generated/checkpoints/lstm_best.pt",
         "predictor_config": "configs/model_lstm.yaml",
         "extra_train": [],
         "extra_eval": [],
     },
     "gnn_fuzzy_drl": {
         "predictor_type": "gnn",
-        "checkpoint": "data/generated/checkpoints/gnn_fuzzy_drl.pt",
-        "predictor_checkpoint": "data/generated/checkpoints/gnn_best.pt",
         "predictor_config": "configs/model_gnn.yaml",
         "extra_train": [],
         "extra_eval": [],
     },
 }
+
+
+def scenario_name(scenario_config: str) -> str:
+    try:
+        data = load_yaml_config(scenario_config)
+        return str(data.get("scenario_name", Path(scenario_config).stem))
+    except Exception:
+        return Path(scenario_config).stem
+
+
+def checkpoint_for(method: str, scenario_config: str) -> Path:
+    return Path("data/generated/checkpoints") / f"{method}_{scenario_name(scenario_config)}.pt"
+
+
+def predictor_checkpoint_for(kind: str, scenario_config: str, best: bool = True) -> Path:
+    suffix = "best" if best else "last"
+    return Path("data/generated/checkpoints") / f"{kind}_{scenario_name(scenario_config)}_{suffix}.pt"
 
 
 def call(args: List[str]) -> None:
@@ -52,20 +63,56 @@ def run_heuristics(config_path: str, output_dir: str, policies: Iterable[str] = 
         run_heuristic(config_path, policy, output_dir)
 
 
-def maybe_train_predictor(kind: str, scenario_config: str, force: bool = False) -> None:
+def maybe_train_predictor(kind: str, scenario_config: str, force: bool = False, epochs: int | None = None) -> Path:
+    best_checkpoint = predictor_checkpoint_for(kind, scenario_config, best=True)
+    last_checkpoint = predictor_checkpoint_for(kind, scenario_config, best=False)
+    if best_checkpoint.exists() and not force:
+        return best_checkpoint
     if kind == "lstm":
-        checkpoint = Path("data/generated/checkpoints/lstm_best.pt")
-        if force or not checkpoint.exists():
-            call([sys.executable, "-m", "predictors.train_lstm", "--scenario-config", scenario_config, "--restart"])
+        args = [
+            sys.executable,
+            "-m",
+            "predictors.train_lstm",
+            "--scenario-config",
+            scenario_config,
+            "--restart",
+            "--checkpoint-path",
+            str(last_checkpoint),
+            "--best-checkpoint-path",
+            str(best_checkpoint),
+            "--log-path",
+            f"data/results/{scenario_name(scenario_config)}/lstm_training_log.csv",
+            "--result-path",
+            f"data/results/{scenario_name(scenario_config)}/lstm_training_summary.json",
+        ]
     elif kind == "gnn":
-        checkpoint = Path("data/generated/checkpoints/gnn_best.pt")
-        if force or not checkpoint.exists():
-            call([sys.executable, "-m", "predictors.train_gnn", "--scenario-config", scenario_config, "--restart"])
+        args = [
+            sys.executable,
+            "-m",
+            "predictors.train_gnn",
+            "--scenario-config",
+            scenario_config,
+            "--restart",
+            "--checkpoint-path",
+            str(last_checkpoint),
+            "--best-checkpoint-path",
+            str(best_checkpoint),
+            "--log-path",
+            f"data/results/{scenario_name(scenario_config)}/gnn_training_log.csv",
+            "--result-path",
+            f"data/results/{scenario_name(scenario_config)}/gnn_training_summary.json",
+        ]
+    else:
+        raise ValueError(f"unknown predictor kind: {kind}")
+    if epochs is not None:
+        args += ["--epochs", str(int(epochs))]
+    call(args)
+    return best_checkpoint
 
 
 def train_drl_method(method: str, scenario_config: str, output_dir: str, total_timesteps: int, max_episode_tasks: int | None, force: bool = False) -> Path:
     spec = DRL_METHODS[method]
-    checkpoint = Path(spec["checkpoint"])
+    checkpoint = checkpoint_for(method, scenario_config)
     if checkpoint.exists() and not force:
         return checkpoint
     args = [
@@ -85,11 +132,11 @@ def train_drl_method(method: str, scenario_config: str, output_dir: str, total_t
     ]
     if max_episode_tasks is not None:
         args += ["--max-episode-tasks", str(int(max_episode_tasks))]
-    if spec.get("predictor_type"):
-        args += ["--predictor-type", spec["predictor_type"]]
-    if spec.get("predictor_checkpoint"):
-        args += ["--predictor-checkpoint-path", spec["predictor_checkpoint"]]
-    if spec.get("predictor_config"):
+    predictor_type = spec.get("predictor_type")
+    if predictor_type:
+        args += ["--predictor-type", predictor_type]
+    if predictor_type in {"lstm", "gnn"}:
+        args += ["--predictor-checkpoint-path", str(predictor_checkpoint_for(predictor_type, scenario_config, best=True))]
         args += ["--predictor-model-config-path", spec["predictor_config"]]
     args += list(spec.get("extra_train", []))
     call(args)
@@ -98,7 +145,7 @@ def train_drl_method(method: str, scenario_config: str, output_dir: str, total_t
 
 def evaluate_drl_method(method: str, scenario_config: str, output_dir: str, episodes: int, max_episode_tasks: int | None) -> None:
     spec = DRL_METHODS[method]
-    checkpoint = Path(spec["checkpoint"])
+    checkpoint = checkpoint_for(method, scenario_config)
     if not checkpoint.exists():
         print(f"SKIP {method}: checkpoint does not exist: {checkpoint}")
         return
@@ -122,11 +169,11 @@ def evaluate_drl_method(method: str, scenario_config: str, output_dir: str, epis
     ]
     if max_episode_tasks is not None:
         args += ["--max-episode-tasks", str(int(max_episode_tasks))]
-    if spec.get("predictor_type"):
-        args += ["--predictor-type", spec["predictor_type"]]
-    if spec.get("predictor_checkpoint"):
-        args += ["--predictor-checkpoint-path", spec["predictor_checkpoint"]]
-    if spec.get("predictor_config"):
+    predictor_type = spec.get("predictor_type")
+    if predictor_type:
+        args += ["--predictor-type", predictor_type]
+    if predictor_type in {"lstm", "gnn"}:
+        args += ["--predictor-checkpoint-path", str(predictor_checkpoint_for(predictor_type, scenario_config, best=True))]
         args += ["--predictor-model-config-path", spec["predictor_config"]]
     args += list(spec.get("extra_eval", []))
     call(args)

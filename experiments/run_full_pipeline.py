@@ -14,6 +14,7 @@ def main() -> None:
     parser.add_argument("--total-timesteps", type=int, default=10000)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-episode-tasks", type=int, default=2000)
+    parser.add_argument("--predictor-epochs", type=int, default=None)
     args = parser.parse_args()
     targets = []
     if args.scenario in {"a", "both"}:
@@ -38,6 +39,8 @@ def main() -> None:
             cmd.append("--train-predictors")
         if args.force_train:
             cmd.append("--force-train")
+        if args.predictor_epochs is not None:
+            cmd += ["--predictor-epochs", str(args.predictor_epochs)]
         call(cmd)
     call([sys.executable, "-m", "plots.generate_all_plots", "--results-dir", "data/results", "--figures-dir", "reports/figures"])
 

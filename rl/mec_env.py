@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -119,12 +120,26 @@ class MECOffloadingEnv(gym.Env):
         task = self.tasks[self.current_index]
         device = self.simulator.device_index[task.device_id]
         self._advance_to(task.arrival_time)
+        online_start = perf_counter()
         candidates = self._current_candidates(task, device)
+        prediction_start = perf_counter()
         prediction = self.predictor.predict(self.simulator)
+        prediction_overhead_s = perf_counter() - prediction_start
         uncertainty = self._effective_prediction_uncertainty(prediction)
         decision = self._decode_action(action, candidates)
-        outcome = self.simulator.apply(self.current_time, task, device, decision)
+        apply_start = perf_counter()
+        outcome = self.simulator.apply(
+            self.current_time,
+            task,
+            device,
+            decision,
+            prediction_overhead_s=prediction_overhead_s,
+        )
+        simulator_apply_overhead_s = perf_counter() - apply_start
+        fuzzy_start = perf_counter()
         reward, reward_info = self.reward_function.compute(outcome, task, device, candidates, uncertainty)
+        fuzzy_overhead_s = perf_counter() - fuzzy_start
+        online_overhead_s = perf_counter() - online_start
         self.current_index += 1
         terminated = self.current_index >= len(self.tasks)
         observation = self._zero_observation() if terminated else self._observation()
@@ -142,6 +157,22 @@ class MECOffloadingEnv(gym.Env):
             "prediction_source": prediction.source,
             "prediction_available": prediction.available,
             "prediction_uncertainty": uncertainty,
+            "data_size_mb": task.data_size_mb,
+            "output_size_mb": task.output_size_mb,
+            "cpu_cycles_mi": task.cpu_cycles_mi,
+            "deadline_s": task.deadline_s,
+            "priority": task.priority,
+            "arrival_time": task.arrival_time,
+            "tx_time_s": outcome.tx_time_s,
+            "rx_time_s": outcome.rx_time_s,
+            "queue_delay_s": outcome.queue_delay_s,
+            "edge_compute_time_s": outcome.edge_compute_time_s,
+            "local_compute_time_s": outcome.local_compute_time_s,
+            "execution_overhead_s": outcome.execution_overhead_s,
+            "prediction_overhead_s": prediction_overhead_s,
+            "fuzzy_overhead_s": fuzzy_overhead_s,
+            "simulator_apply_overhead_s": simulator_apply_overhead_s,
+            "online_overhead_s": online_overhead_s,
             **reward_info,
         }
         self.last_info = info

@@ -88,6 +88,8 @@ def load_or_create_cache(scenario_config_path: str | Path, model_config: Dict[st
 
 def train(args: argparse.Namespace) -> Dict[str, Any]:
     model_config = load_yaml(args.model_config)
+    if getattr(args, "epochs", None) is not None:
+        model_config["epochs"] = int(args.epochs)
     torch.manual_seed(int(model_config.get("seed", 0)))
     np.random.seed(int(model_config.get("seed", 0)))
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -97,6 +99,8 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     target_size = int(model_config.get("target_size", trace.shape[1]))
     x, y = build_sequence_windows(trace, lookback, horizon, target_size=target_size)
     dataset = SequenceWindowDataset(x, y)
+    scenario_dict = load_yaml_config(args.scenario_config)
+    physical_task_count = int(scenario_dict["devices"]["count"]) * int(scenario_dict["tasks"]["tasks_per_device"])
     val_size = max(1, int(len(dataset) * float(model_config.get("validation_fraction", 0.2))))
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(int(model_config.get("seed", 0))))
@@ -158,7 +162,16 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             best_val_loss = val_loss
             save_lstm_checkpoint(args.best_checkpoint_path, model, optimizer, epoch, best_val_loss, metadata)
         save_lstm_checkpoint(checkpoint_path, model, optimizer, epoch, best_val_loss, metadata)
-    result = {"checkpoint": str(checkpoint_path), "best_checkpoint": str(args.best_checkpoint_path), "cache": str(cache_path), "best_val_loss": best_val_loss}
+    result = {
+        "checkpoint": str(checkpoint_path),
+        "best_checkpoint": str(args.best_checkpoint_path),
+        "cache": str(cache_path),
+        "best_val_loss": best_val_loss,
+        "epochs": int(epochs),
+        "num_windows": int(len(dataset)),
+        "physical_task_count": int(physical_task_count),
+        "learning_task_equivalent": int(len(dataset) * int(epochs)),
+    }
     result_path = Path(args.result_path)
     result_path.parent.mkdir(parents=True, exist_ok=True)
     with result_path.open("w", encoding="utf-8") as file:
@@ -178,6 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="")
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--epochs", type=int, default=None)
     return parser.parse_args()
 
 
