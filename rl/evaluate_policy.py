@@ -32,7 +32,9 @@ def write_info_csv(rows: List[Dict[str, Any]], path: str | Path) -> None:
         writer = csv.DictWriter(file, fieldnames=keys)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            # CSV stores Python booleans as True/False strings.
+            # Normalize them to 1/0 so downstream plotting scripts can parse them consistently.
+            writer.writerow({key: (int(value) if isinstance(value, bool) else value) for key, value in row.items()})
 
 
 def summarize(step_rows: List[Dict[str, Any]], total_rewards: List[float]) -> Dict[str, float]:
