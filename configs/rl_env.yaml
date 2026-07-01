@@ -3,8 +3,8 @@ include_fuzzy_weights: true
 prediction_uncertainty: 0.0
 max_episode_tasks: 400
 predictor_type: none
-predictor_checkpoint_path: ''
-predictor_model_config_path: ''
+predictor_checkpoint_path: ""
+predictor_model_config_path: ""
 include_prediction: true
 predictive_feature_size: 10
 prediction_fallback_uncertainty: 0.5
@@ -18,7 +18,7 @@ reward:
   server_penalty: 0.5
   reward_clip: 10.0
   use_static_weights: false
-  static_energy_weight: 2.0
-  static_latency_weight: 0.0
-  static_success_weight: 1.0
-  static_reliability_weight: 0.0
+  static_energy_weight: 0.25
+  static_latency_weight: 0.25
+  static_success_weight: 0.25
+  static_reliability_weight: 0.25
