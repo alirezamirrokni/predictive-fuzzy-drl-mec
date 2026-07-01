@@ -1,10 +1,5 @@
 # DRL-Fuzzy-Predictive MEC — Kaggle / Colab Commands
 
-This README is updated to match the attached `iotlab.ipynb` workflow. The notebook runs the project on Kaggle, copies the project from a Kaggle input dataset into `/kaggle/working`, installs dependencies, runs sanity checks, trains Scenario A and Scenario B, generates all plots, and finally zips the results, figures, and checkpoints.
-
-The public ResearchGate/IEEE pages for the RASOUL reference expose the paper identity and abstract, but not the full numerical experiment table. This project therefore centralizes experiment variables in `configs/rasoul_reference.yaml` and reuses the same field names across scenario YAML files. If you later obtain the full IEEE PDF table, update those values and rerun the same commands.
-
----
 
 ## 1) Kaggle setup used in `iotlab.ipynb`
 
