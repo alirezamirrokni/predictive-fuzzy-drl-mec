@@ -1,0 +1,17 @@
+{
+  "tasks": 120000,
+  "success_ratio": 0.811125,
+  "average_latency_s": 0.7930562064723787,
+  "average_energy_j": 0.519276025463157,
+  "average_reliability": 0.8463747814198908,
+  "deadline_violation_rate": 0.043958333333333335,
+  "battery_failure_rate": 0.0,
+  "channel_failure_rate": 0.138175,
+  "server_failure_rate": 0.0166,
+  "local_ratio": 0.023625,
+  "edge_ratio": 0.5870333333333333,
+  "partial_ratio": 0.38934166666666664,
+  "average_execution_overhead_s": 0.6193220946706033,
+  "average_online_overhead_s": 0.0003600187967080956,
+  "total_online_overhead_s": 43.20225560497147
+}
