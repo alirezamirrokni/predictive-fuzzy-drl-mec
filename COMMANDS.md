@@ -118,12 +118,12 @@ data/results/scenario_a_600_final/static_weight_drl_metrics.csv
 
 ## 5) Scenario B: 300 IoT devices, 30 heterogeneous edge servers, 200 tasks/device
 
-This is the main Scenario B run from `iotlab.ipynb`. It generates 60,000 tasks and writes outputs to `data/results/scenario_b_30_gpu`.
+This is the main Scenario B run from `iotlab.ipynb`. It generates 60,000 tasks and writes outputs to `data/results/scenario_b_30`.
 
 ```bash
 PYTHONPATH=/kaggle/working/predictive-fuzzy-drl-mec-main python -m experiments.run_scenario_b \
   --config configs/scenario_b_30.yaml \
-  --output-dir data/results/scenario_b_30_gpu \
+  --output-dir data/results/scenario_b_30 \
   --train-predictors \
   --force-train \
   --predictor-epochs 50 \
@@ -135,14 +135,14 @@ PYTHONPATH=/kaggle/working/predictive-fuzzy-drl-mec-main python -m experiments.r
 Typical generated files include:
 
 ```text
-data/results/scenario_b_30_gpu/scenario_b_30_local_only_metrics.csv
-data/results/scenario_b_30_gpu/scenario_b_30_random_metrics.csv
-data/results/scenario_b_30_gpu/scenario_b_30_greedy_latency_metrics.csv
-data/results/scenario_b_30_gpu/scenario_b_30_greedy_energy_metrics.csv
-data/results/scenario_b_30_gpu/lstm_fuzzy_drl_metrics.csv
-data/results/scenario_b_30_gpu/gnn_fuzzy_drl_metrics.csv
-data/results/scenario_b_30_gpu/no_prediction_drl_metrics.csv
-data/results/scenario_b_30_gpu/static_weight_drl_metrics.csv
+data/results/scenario_b_30/scenario_b_30_local_only_metrics.csv
+data/results/scenario_b_30/scenario_b_30_random_metrics.csv
+data/results/scenario_b_30/scenario_b_30_greedy_latency_metrics.csv
+data/results/scenario_b_30/scenario_b_30_greedy_energy_metrics.csv
+data/results/scenario_b_30/lstm_fuzzy_drl_metrics.csv
+data/results/scenario_b_30/gnn_fuzzy_drl_metrics.csv
+data/results/scenario_b_30/no_prediction_drl_metrics.csv
+data/results/scenario_b_30/static_weight_drl_metrics.csv
 ```
 
 ---
@@ -183,7 +183,7 @@ The output folder should look like this:
 
 ```text
 reports/figures/scenario_a_600_final/
-reports/figures/scenario_b_30_gpu/
+reports/figures/scenario_b_30/
 ```
 
 ---
