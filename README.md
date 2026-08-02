@@ -93,8 +93,3 @@ For each scenario, the pipeline writes:
 - per-method task-mode and task-specification charts
 - mean online overhead, maximum online overhead, per-task overhead, and learning-overhead charts
 
-## Fairness and interpretation
-
-The code does not alter metrics, rewards, failures, or test samples to force LSTM to win. The selected hyperparameters are strong, symmetric choices; best PPO checkpoints are chosen on a fixed validation workload. LSTM is expected to benefit from the explicitly temporal global trace, but **no scientifically valid implementation can guarantee that it wins every metric before the experiment is run**. If it does not, report that result and tune only with predictor/PPO validation data—not the final evaluation seeds.
-
-See `docs/PARAMETER_AUDIT.md` for the source and units of every physical value, `docs/MODEL_AND_FORMULAS.md` for equations, and `COMMANDS.md` for individual commands.
