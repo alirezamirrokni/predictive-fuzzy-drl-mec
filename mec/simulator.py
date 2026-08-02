@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import perf_counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from time import perf_counter
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import yaml
 
 from .channel import WirelessChannel
 from .device import IoTDevice
+from .edgesimpy_backend import EdgeSimPyBackend
 from .metrics import MetricRecord, MetricsLogger
-from .mobility import MobilityModel
+from .project_spec import validate_production_config
 from .server import EdgeServer
 from .task import Task
 
 
 @dataclass(slots=True)
 class OffloadingDecision:
+    """partial_ratio is the remotely executed fraction."""
+
     mode: str
     server_id: Optional[int] = None
     partial_ratio: float = 0.0
@@ -28,16 +31,16 @@ class OffloadingDecision:
         if self.mode == "edge":
             if self.server_id is None:
                 raise ValueError("edge decision requires server_id")
-            return OffloadingDecision("edge", self.server_id, 1.0)
+            return OffloadingDecision("edge", int(self.server_id), 1.0)
         if self.mode == "partial":
             if self.server_id is None:
                 raise ValueError("partial decision requires server_id")
             ratio = min(1.0, max(0.0, float(self.partial_ratio)))
-            if ratio == 0.0:
+            if ratio <= 0.0:
                 return OffloadingDecision("local", None, 0.0)
-            if ratio == 1.0:
-                return OffloadingDecision("edge", self.server_id, 1.0)
-            return OffloadingDecision("partial", self.server_id, ratio)
+            if ratio >= 1.0:
+                return OffloadingDecision("edge", int(self.server_id), 1.0)
+            return OffloadingDecision("partial", int(self.server_id), ratio)
         raise ValueError("mode must be local, edge, or partial")
 
 
@@ -46,11 +49,12 @@ class SimulationOutcome:
     latency_s: float
     energy_j: float
     reliability: float
+    reliability_satisfied: bool
     success: bool
     deadline_violation: bool
-    failed_due_to_battery: bool
-    failed_due_to_channel: bool
-    failed_due_to_server: bool
+    failed_due_to_battery: bool = False
+    failed_due_to_channel: bool = False
+    failed_due_to_server: bool = False
     tx_time_s: float = 0.0
     rx_time_s: float = 0.0
     queue_delay_s: float = 0.0
@@ -59,7 +63,6 @@ class SimulationOutcome:
 
     @property
     def execution_overhead_s(self) -> float:
-        """Non-compute communication/queueing overhead until the task leaves the system."""
         return float(self.tx_time_s + self.rx_time_s + self.queue_delay_s)
 
 
@@ -69,30 +72,75 @@ class MECSimulator:
         devices: List[IoTDevice],
         servers: List[EdgeServer],
         channel: WirelessChannel,
-        mobility: MobilityModel,
         slot_duration_s: float,
         time_slots: int,
         rng: np.random.Generator,
+        require_edgesimpy: bool,
+        scenario_sample: Dict[str, Any],
     ) -> None:
         self.devices = devices
         self.servers = servers
         self.channel = channel
-        self.mobility = mobility
-        self.slot_duration_s = slot_duration_s
-        self.time_slots = time_slots
+        self.slot_duration_s = float(slot_duration_s)
+        self.time_slots = int(time_slots)
         self.rng = rng
         self.metrics = MetricsLogger()
         self.server_index = {server.server_id: server for server in servers}
         self.device_index = {device.device_id: device for device in devices}
+        self.current_slot = 0
+        self.scenario_sample = dict(scenario_sample)
         for device in devices:
             device.validate()
         for server in servers:
             server.validate()
+        self.backend = EdgeSimPyBackend(self.slot_duration_s, self._physics_tick, required=require_edgesimpy)
+        self.scenario_sample["simulation_backend"] = self.backend.name
+
+    def _physics_tick(self) -> None:
+        for server in self.servers:
+            server.process_slot(self.slot_duration_s)
+        self.current_slot += 1
+
+    def advance_one_slot(self) -> None:
+        self.backend.step()
+
+    def advance_to(self, target_slot: int) -> None:
+        while self.current_slot < int(target_slot):
+            self.advance_one_slot()
 
     def server_by_id(self, server_id: int) -> EdgeServer:
         if server_id not in self.server_index:
             raise KeyError(f"unknown server_id {server_id}")
         return self.server_index[server_id]
+
+    def candidate_servers(self, device: IoTDevice, top_k: Optional[int] = None) -> List[EdgeServer]:
+        servers = sorted(
+            self.servers,
+            key=lambda server: (
+                server.queue_delay(),
+                -server.availability,
+                -server.cpu_capacity_mips,
+                -self.channel.data_rate_mbps(server.bandwidth_mhz, device.tx_power_w, device.device_id, server.server_id),
+            ),
+        )
+        if top_k is None or top_k <= 0:
+            return servers
+        return servers[: min(int(top_k), len(servers))]
+
+    def all_candidate_decisions(
+        self,
+        include_partial: bool = True,
+        device: Optional[IoTDevice] = None,
+        task: Optional[Task] = None,
+        top_k: Optional[int] = None,
+    ) -> Iterable[OffloadingDecision]:
+        yield OffloadingDecision("local")
+        servers = self.servers if device is None else self.candidate_servers(device, top_k)
+        for server in servers:
+            yield OffloadingDecision("edge", server.server_id, 1.0)
+            if include_partial:
+                local_fraction = 0.3 if task is None else task.local_fraction
+                yield OffloadingDecision("partial", server.server_id, 1.0 - local_fraction)
 
     def estimate(self, task: Task, device: IoTDevice, decision: OffloadingDecision) -> SimulationOutcome:
         decision = decision.normalized()
@@ -117,18 +165,15 @@ class MECSimulator:
     ) -> SimulationOutcome:
         decision = decision.normalized()
         apply_start = perf_counter()
-        outcome = self.estimate(task, device, decision)
-        outcome = self._sample_failures(task, device, decision, outcome)
-        device.consume_energy(outcome.energy_j)
+        outcome = self._sample_availability(device, decision, self.estimate(task, device, decision))
         if decision.mode in {"edge", "partial"} and decision.server_id is not None:
-            server = self.server_by_id(decision.server_id)
-            server.add_workload(task.cpu_cycles_mi * decision.partial_ratio)
+            self.server_by_id(decision.server_id).add_workload(task.cpu_cycles_mi * decision.partial_ratio)
         simulator_apply_overhead_s = perf_counter() - apply_start
         if online_overhead_s <= 0.0:
             online_overhead_s = policy_overhead_s + prediction_overhead_s + fuzzy_overhead_s + drl_overhead_s + simulator_apply_overhead_s
         self.metrics.log(
             MetricRecord(
-                time_slot=time_slot,
+                time_slot=int(time_slot),
                 task_id=task.task_id,
                 device_id=task.device_id,
                 mode=decision.mode,
@@ -137,17 +182,22 @@ class MECSimulator:
                 latency_s=outcome.latency_s,
                 energy_j=outcome.energy_j,
                 reliability=outcome.reliability,
+                reliability_satisfied=int(outcome.reliability_satisfied),
+                reliability_target=device.reliability_target,
                 success=int(outcome.success),
                 deadline_violation=int(outcome.deadline_violation),
-                failed_due_to_battery=int(outcome.failed_due_to_battery),
-                failed_due_to_channel=int(outcome.failed_due_to_channel),
+                failed_due_to_battery=0,
+                failed_due_to_channel=0,
                 failed_due_to_server=int(outcome.failed_due_to_server),
                 data_size_mb=task.data_size_mb,
                 output_size_mb=task.output_size_mb,
                 cpu_cycles_mi=task.cpu_cycles_mi,
                 deadline_s=task.deadline_s,
-                priority=task.priority,
-                arrival_time=task.arrival_time,
+                priority=1,
+                arrival_time=task.arrival_slot,
+                release_time_s=task.release_time_s,
+                release_interval_s=task.release_interval_s,
+                task_local_fraction=task.local_fraction,
                 tx_time_s=outcome.tx_time_s,
                 rx_time_s=outcome.rx_time_s,
                 queue_delay_s=outcome.queue_delay_s,
@@ -165,157 +215,82 @@ class MECSimulator:
         return outcome
 
     def run(self, policy: Any) -> MetricsLogger:
-        for time_slot in range(self.time_slots):
-            for server in self.servers:
-                server.process_slot(self.slot_duration_s)
+        for slot in range(self.time_slots):
+            self.advance_to(slot)
             for device in self.devices:
-                self.mobility.update(device, self.rng, self.slot_duration_s)
-            for device in self.devices:
-                ready_tasks = device.pop_ready_tasks(time_slot)
-                for task in ready_tasks:
-                    policy_start = perf_counter()
+                for task in device.pop_ready_tasks(slot):
+                    start = perf_counter()
                     decision = policy.choose(self, task, device)
-                    policy_overhead_s = perf_counter() - policy_start
-                    self.apply(time_slot, task, device, decision, policy_overhead_s=policy_overhead_s)
-        remaining = []
-        for device in self.devices:
-            remaining.extend(device.task_queue)
-            device.task_queue.clear()
-        if remaining:
-            last_slot = max(0, self.time_slots - 1)
-            for task in remaining:
-                device = self.device_index[task.device_id]
-                policy_start = perf_counter()
-                decision = policy.choose(self, task, device)
-                policy_overhead_s = perf_counter() - policy_start
-                self.apply(last_slot, task, device, decision, policy_overhead_s=policy_overhead_s)
+                    self.apply(slot, task, device, decision, policy_overhead_s=perf_counter() - start)
         return self.metrics
-
-    def candidate_servers(self, device: IoTDevice, top_k: Optional[int] = None) -> List[EdgeServer]:
-        servers = sorted(
-            self.servers,
-            key=lambda server: (
-                server.queue_delay(),
-                self.channel.distance_m(device.position, server.position),
-                -server.cpu_capacity_mips,
-            ),
-        )
-        if top_k is None or top_k <= 0:
-            return servers
-        return servers[: min(top_k, len(servers))]
-
-    def all_candidate_decisions(self, include_partial: bool = True, device: Optional[IoTDevice] = None, top_k: Optional[int] = None) -> Iterable[OffloadingDecision]:
-        yield OffloadingDecision("local")
-        servers = self.servers if device is None else self.candidate_servers(device, top_k)
-        for server in servers:
-            yield OffloadingDecision("edge", server.server_id, 1.0)
-            if include_partial:
-                for ratio in (0.25, 0.5, 0.75):
-                    yield OffloadingDecision("partial", server.server_id, ratio)
 
     def _estimate_local(self, task: Task, device: IoTDevice) -> SimulationOutcome:
         local_time = task.cpu_cycles_mi / device.cpu_capacity_mips
-        energy = device.local_power_w * local_time
-        reliability = max(0.0, 1.0 - device.failure_probability)
-        failed_battery = device.battery_j < energy
+        energy = device.compute_power_w * local_time
         deadline_violation = local_time > task.deadline_s
-        success = not failed_battery and not deadline_violation
         return SimulationOutcome(
             latency_s=local_time,
             energy_j=energy,
-            reliability=reliability,
-            success=success,
+            reliability=1.0,
+            reliability_satisfied=True,
+            success=not deadline_violation,
             deadline_violation=deadline_violation,
-            failed_due_to_battery=failed_battery,
-            failed_due_to_channel=False,
-            failed_due_to_server=False,
             local_compute_time_s=local_time,
         )
 
-    def _sample_failures(self, task: Task, device: IoTDevice, decision: OffloadingDecision, outcome: SimulationOutcome) -> SimulationOutcome:
-        failed_channel = False
-        failed_server = False
-        failed_device = False
-        if decision.mode == "local":
-            failed_device = self.rng.random() < device.failure_probability
-        if decision.mode in {"edge", "partial"} and decision.server_id is not None:
-            server = self.server_by_id(decision.server_id)
-            failed_server = self.rng.random() < server.failure_probability
-            failed_channel = self.rng.random() < self.channel.packet_loss_probability(device.position, server.position)
-        if decision.mode == "partial":
-            failed_device = self.rng.random() < device.failure_probability
-        success = outcome.success and not failed_channel and not failed_server and not failed_device
-        return SimulationOutcome(
-            latency_s=outcome.latency_s,
-            energy_j=outcome.energy_j,
-            reliability=outcome.reliability,
-            success=success,
-            deadline_violation=outcome.deadline_violation,
-            failed_due_to_battery=outcome.failed_due_to_battery,
-            failed_due_to_channel=failed_channel,
-            failed_due_to_server=failed_server or failed_device,
-            tx_time_s=outcome.tx_time_s,
-            rx_time_s=outcome.rx_time_s,
-            queue_delay_s=outcome.queue_delay_s,
-            edge_compute_time_s=outcome.edge_compute_time_s,
-            local_compute_time_s=outcome.local_compute_time_s,
-        )
-
     def _estimate_remote(self, task: Task, device: IoTDevice, server: EdgeServer, ratio: float) -> SimulationOutcome:
-        data_rate = self.channel.data_rate_mbps(server.bandwidth_mhz, device.tx_power_w, device.position, server.position)
-        tx_time = task.data_size_mb * 8.0 * ratio / data_rate
-        rx_time = task.output_size_mb * 8.0 * ratio / data_rate
+        rate = self.channel.data_rate_mbps(server.bandwidth_mhz, device.tx_power_w, device.device_id, server.server_id)
+        tx_time = task.data_size_mb * 8.0 * ratio / rate
+        rx_time = task.output_size_mb * 8.0 * ratio / rate
         queue_delay = server.queue_delay()
         compute_time = task.cpu_cycles_mi * ratio / server.cpu_capacity_mips
         latency = tx_time + queue_delay + compute_time + rx_time
         energy = device.tx_power_w * tx_time
-        packet_loss_probability = self.channel.packet_loss_probability(device.position, server.position)
-        reliability = max(0.0, (1.0 - packet_loss_probability) * server.reliability)
-        failed_battery = device.battery_j < energy
+        reliability = server.availability
         deadline_violation = latency > task.deadline_s
-        success = not failed_battery and not deadline_violation
         return SimulationOutcome(
             latency_s=latency,
             energy_j=energy,
             reliability=reliability,
-            success=success,
+            reliability_satisfied=reliability >= device.reliability_target,
+            success=not deadline_violation,
             deadline_violation=deadline_violation,
-            failed_due_to_battery=failed_battery,
-            failed_due_to_channel=False,
-            failed_due_to_server=False,
             tx_time_s=tx_time,
             rx_time_s=rx_time,
             queue_delay_s=queue_delay,
             edge_compute_time_s=compute_time,
         )
 
-    def _estimate_partial(self, task: Task, device: IoTDevice, server: EdgeServer, ratio: float) -> SimulationOutcome:
-        remote = self._estimate_remote(task, device, server, ratio)
-        local_cycles = task.cpu_cycles_mi * (1.0 - ratio)
-        local_time = local_cycles / device.cpu_capacity_mips
-        local_energy = device.local_power_w * local_time
+    def _estimate_partial(self, task: Task, device: IoTDevice, server: EdgeServer, offload_ratio: float) -> SimulationOutcome:
+        remote = self._estimate_remote(task, device, server, offload_ratio)
+        local_ratio = 1.0 - offload_ratio
+        local_time = task.cpu_cycles_mi * local_ratio / device.cpu_capacity_mips
+        local_energy = device.compute_power_w * local_time
         latency = max(local_time, remote.latency_s)
         energy = local_energy + remote.energy_j
-        local_reliability = max(0.0, 1.0 - device.failure_probability)
-        reliability = local_reliability * remote.reliability
-        failed_battery = device.battery_j < energy
         deadline_violation = latency > task.deadline_s
-        success = remote.success and not failed_battery and not deadline_violation
         return SimulationOutcome(
             latency_s=latency,
             energy_j=energy,
-            reliability=reliability,
-            success=success,
+            reliability=remote.reliability,
+            reliability_satisfied=remote.reliability_satisfied,
+            success=not deadline_violation,
             deadline_violation=deadline_violation,
-            failed_due_to_battery=failed_battery,
-            failed_due_to_channel=remote.failed_due_to_channel,
-            failed_due_to_server=remote.failed_due_to_server,
             tx_time_s=remote.tx_time_s,
             rx_time_s=remote.rx_time_s,
             queue_delay_s=remote.queue_delay_s,
             edge_compute_time_s=remote.edge_compute_time_s,
             local_compute_time_s=local_time,
         )
+
+    def _sample_availability(self, device: IoTDevice, decision: OffloadingDecision, outcome: SimulationOutcome) -> SimulationOutcome:
+        failed_server = False
+        if decision.mode in {"edge", "partial"} and decision.server_id is not None:
+            failed_server = bool(self.rng.random() > self.server_by_id(decision.server_id).availability)
+        outcome.failed_due_to_server = failed_server
+        outcome.success = bool(outcome.success and not failed_server)
+        outcome.reliability_satisfied = bool(outcome.reliability >= device.reliability_target)
+        return outcome
 
 
 def load_yaml_config(path: str | Path) -> Dict[str, Any]:
@@ -326,101 +301,99 @@ def load_yaml_config(path: str | Path) -> Dict[str, Any]:
     return loaded
 
 
-def build_simulator_from_config(config: Dict[str, Any]) -> MECSimulator:
-    seed = int(config.get("seed", 0))
+def _uniform(rng: np.random.Generator, bounds: Sequence[float]) -> float:
+    if len(bounds) != 2 or float(bounds[0]) > float(bounds[1]):
+        raise ValueError(f"invalid uniform bounds: {bounds}")
+    return float(rng.uniform(float(bounds[0]), float(bounds[1])))
+
+
+def _integers(rng: np.random.Generator, bounds: Sequence[int]) -> int:
+    if len(bounds) != 2 or int(bounds[0]) > int(bounds[1]):
+        raise ValueError(f"invalid integer bounds: {bounds}")
+    return int(rng.integers(int(bounds[0]), int(bounds[1]) + 1))
+
+
+def _sample_count(rng: np.random.Generator, value: int | Sequence[int]) -> int:
+    return int(value) if isinstance(value, (int, np.integer)) else _integers(rng, value)
+
+
+def build_simulator_from_config(config: Dict[str, Any], seed_override: Optional[int] = None) -> MECSimulator:
+    validate_production_config(config)
+    seed = int(config.get("seed", 0) if seed_override is None else seed_override)
     rng = np.random.default_rng(seed)
-    area = config["area"]
-    mobility = MobilityModel(float(area["width_m"]), float(area["height_m"]))
-    devices = _generate_devices(config, mobility, rng)
-    servers = _generate_servers(config, mobility, rng)
-    tasks = _generate_tasks(config, rng)
-    for task in tasks:
-        devices[task.device_id].add_task(task)
-    channel_config = config["channel"]
-    channel = WirelessChannel(
-        noise_power_w=float(channel_config["noise_power_w"]),
-        path_loss_exponent=float(channel_config["path_loss_exponent"]),
-        reference_gain=float(channel_config["reference_gain"]),
-        min_rate_mbps=float(channel_config["min_rate_mbps"]),
-        packet_loss_base=float(channel_config["packet_loss_base"]),
-    )
+    device_cfg = config["devices"]
+    server_cfg = config["servers"]
+    task_cfg = config["tasks"]
+    sim_cfg = config["simulation"]
+    channel_cfg = config["channel"]
+    device_count = _sample_count(rng, device_cfg["count"])
+    server_count = _sample_count(rng, server_cfg["count"])
+
+    devices = [
+        IoTDevice(
+            device_id=i,
+            cpu_frequency_ghz=_uniform(rng, device_cfg["processing_frequency_ghz"]),
+            tx_power_w=_uniform(rng, device_cfg["transmission_power_mw"]) / 1000.0,
+            compute_power_w=_uniform(rng, device_cfg["computation_power_mw"]) / 1000.0,
+            reliability_target=_uniform(rng, device_cfg["reliability_target"]),
+            position=tuple(rng.uniform(0.0, 1.0, size=2).tolist()),
+        )
+        for i in range(device_count)
+    ]
+    servers = [
+        EdgeServer(
+            server_id=i,
+            cores=_integers(rng, server_cfg["cores"]),
+            cpu_frequency_ghz=_uniform(rng, server_cfg["processing_frequency_ghz"]),
+            bandwidth_mhz=_uniform(rng, server_cfg["bandwidth_mhz"]),
+            availability=_uniform(rng, server_cfg["long_term_availability"]),
+            position=tuple(rng.uniform(0.0, 1.0, size=2).tolist()),
+        )
+        for i in range(server_count)
+    ]
+    tick = float(sim_cfg["tick_duration_s"])
+    tasks: List[Task] = []
+    task_id = 0
+    for device_id in range(device_count):
+        release_time = 0.0
+        for _ in range(int(task_cfg["tasks_per_device"])):
+            interval = _uniform(rng, task_cfg["release_interval_s"])
+            release_time += interval
+            task = Task(
+                task_id=task_id,
+                device_id=device_id,
+                data_size_mb=_uniform(rng, task_cfg["data_size_mb"]),
+                cpu_cycles_mi=_uniform(rng, task_cfg["cpu_cycles"]) / 1e6,
+                deadline_s=_uniform(rng, task_cfg["relative_deadline_s"]),
+                local_fraction=_uniform(rng, task_cfg["local_fraction"]),
+                release_interval_s=interval,
+                release_time_s=release_time,
+                arrival_slot=int(np.ceil(release_time / tick)),
+            )
+            task.validate()
+            tasks.append(task)
+            devices[device_id].add_task(task)
+            task_id += 1
+    time_slots = max((task.arrival_slot for task in tasks), default=0) + 1
+    gain_low, gain_high = channel_cfg["channel_gain"]
+    gain_matrix = rng.uniform(float(gain_low), float(gain_high), size=(device_count, server_count)).astype(np.float64)
+    channel = WirelessChannel(noise_power_w=float(channel_cfg["noise_power_mw"]) / 1000.0, gain_matrix=gain_matrix)
+    sample = {
+        "seed": seed,
+        "device_count": device_count,
+        "server_count": server_count,
+        "tasks_per_device": int(task_cfg["tasks_per_device"]),
+        "total_tasks": len(tasks),
+        "time_slots": time_slots,
+        "tick_duration_s": tick,
+    }
     return MECSimulator(
         devices=devices,
         servers=servers,
         channel=channel,
-        mobility=mobility,
-        slot_duration_s=float(config["simulation"]["slot_duration_s"]),
-        time_slots=int(config["simulation"]["time_slots"]),
+        slot_duration_s=tick,
+        time_slots=time_slots,
         rng=rng,
+        require_edgesimpy=bool(sim_cfg.get("require_edgesimpy", True)),
+        scenario_sample=sample,
     )
-
-
-def _uniform(rng: np.random.Generator, bounds: List[float]) -> float:
-    return float(rng.uniform(float(bounds[0]), float(bounds[1])))
-
-
-def _integers(rng: np.random.Generator, bounds: List[int]) -> int:
-    return int(rng.integers(int(bounds[0]), int(bounds[1]) + 1))
-
-
-def _generate_devices(config: Dict[str, Any], mobility: MobilityModel, rng: np.random.Generator) -> List[IoTDevice]:
-    device_config = config["devices"]
-    devices = []
-    for device_id in range(int(device_config["count"])):
-        devices.append(
-            IoTDevice(
-                device_id=device_id,
-                cpu_capacity_mips=_uniform(rng, device_config["cpu_capacity_mips"]),
-                battery_j=_uniform(rng, device_config["battery_j"]),
-                tx_power_w=_uniform(rng, device_config["tx_power_w"]),
-                local_power_w=_uniform(rng, device_config["local_power_w"]),
-                position=mobility.random_position(rng),
-                mobility_speed_mps=_uniform(rng, device_config["mobility_speed_mps"]),
-                failure_probability=_uniform(rng, device_config["failure_probability"]),
-            )
-        )
-    return devices
-
-
-def _generate_servers(config: Dict[str, Any], mobility: MobilityModel, rng: np.random.Generator) -> List[EdgeServer]:
-    server_config = config["servers"]
-    servers = []
-    for server_id in range(int(server_config["count"])):
-        servers.append(
-            EdgeServer(
-                server_id=server_id,
-                cpu_capacity_mips=_uniform(rng, server_config["cpu_capacity_mips"]),
-                bandwidth_mhz=_uniform(rng, server_config["bandwidth_mhz"]),
-                position=mobility.random_position(rng),
-                failure_probability=_uniform(rng, server_config["failure_probability"]),
-                static_power_w=_uniform(rng, server_config["static_power_w"]),
-                dynamic_power_w=_uniform(rng, server_config["dynamic_power_w"]),
-            )
-        )
-    return servers
-
-
-def _generate_tasks(config: Dict[str, Any], rng: np.random.Generator) -> List[Task]:
-    device_count = int(config["devices"]["count"])
-    task_config = config["tasks"]
-    tasks_per_device = int(task_config["tasks_per_device"])
-    time_slots = int(config["simulation"]["time_slots"])
-    tasks = []
-    task_id = 0
-    for device_id in range(device_count):
-        for _ in range(tasks_per_device):
-            task = Task(
-                task_id=task_id,
-                device_id=device_id,
-                data_size_mb=_uniform(rng, task_config["data_size_mb"]),
-                output_size_mb=_uniform(rng, task_config["output_size_mb"]),
-                cpu_cycles_mi=_uniform(rng, task_config["cpu_cycles_mi"]),
-                deadline_s=_uniform(rng, task_config["deadline_s"]),
-                priority=_integers(rng, task_config["priority"]),
-                arrival_time=int(rng.integers(0, max(1, time_slots))),
-            )
-            task.validate()
-            tasks.append(task)
-            task_id += 1
-    tasks.sort(key=lambda item: (item.arrival_time, item.device_id, item.task_id))
-    return tasks

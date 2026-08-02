@@ -5,6 +5,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -12,7 +13,7 @@ import torch
 import yaml
 
 from .mec_env import MECEnvConfig, MECOffloadingEnv
-from .ppo_agent import ActorCritic, PPOModelConfig, RolloutBuffer, action_dims_from_env, save_ppo_checkpoint
+from .ppo_agent import ActorCritic, PPOModelConfig, RolloutBuffer, action_dims_from_env, load_ppo_checkpoint, save_ppo_checkpoint
 from .reward import RewardConfig
 
 
@@ -31,6 +32,13 @@ class PPOTrainConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     hidden_size: int = 128
+    adam_epsilon: float = 1e-5
+    normalize_advantage: bool = True
+    checkpoint_every_updates: int = 1
+    recent_success_window_tasks: int = 5000
+    validation_every_updates: int = 10
+    validation_tasks: int = 10000
+    validation_seed: int = 9000
 
     @classmethod
     def from_dict(cls, data: Dict[str, object] | None) -> "PPOTrainConfig":
@@ -107,18 +115,33 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     obs_dim = int(np.asarray(obs).shape[0])
     action_dims = action_dims_from_env(env)
     model = ActorCritic(PPOModelConfig(obs_dim, action_dims, cfg.hidden_size)).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, eps=cfg.adam_epsilon)
+    resume_metadata: Dict[str, Any] = {}
+    if args.resume and Path(args.checkpoint_path).exists():
+        restored, checkpoint = load_ppo_checkpoint(args.checkpoint_path, map_location=device)
+        if restored.config.observation_dim != obs_dim or list(restored.config.action_dims) != action_dims:
+            raise ValueError("PPO checkpoint observation/action schema does not match the current environment")
+        model.load_state_dict(restored.state_dict())
+        if checkpoint.get("optimizer_state_dict") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        resume_metadata = dict(checkpoint.get("metadata", {}))
 
     log_path = Path(args.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["update", "global_step", "mean_reward", "policy_loss", "value_loss", "entropy", "approx_kl"])
-        writer.writeheader()
+    log_mode = "a" if args.resume and log_path.exists() else "w"
+    with log_path.open(log_mode, newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=["update", "global_step", "mean_reward", "recent_success_ratio", "policy_loss", "value_loss", "entropy", "approx_kl", "validation_reward"])
+        if log_mode == "w":
+            writer.writeheader()
 
-    global_step = 0
-    update = 0
+    global_step = int(resume_metadata.get("global_step", 0))
+    update = int(resume_metadata.get("update", 0))
     episode_rewards = []
     current_episode_reward = 0.0
+    recent_rewards = []
+    recent_successes = []
+    best_validation_reward = -float("inf")
+    started_at = monotonic()
     obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
     n_steps = max(1, int(cfg.n_steps))
 
@@ -133,6 +156,12 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             done = bool(terminated or truncated)
             buffer.add(obs_tensor, action.squeeze(0), logprob.squeeze(0), float(reward), done, value.squeeze(0))
             current_episode_reward += float(reward)
+            recent_rewards.append(float(reward))
+            recent_successes.append(float(info.get("success", 0.0)))
+            window = int(cfg.recent_success_window_tasks)
+            if len(recent_rewards) > window:
+                recent_rewards = recent_rewards[-window:]
+                recent_successes = recent_successes[-window:]
             global_step += 1
             if done:
                 episode_rewards.append(current_episode_reward)
@@ -143,7 +172,8 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             _, _, _, last_value = model.get_action_and_value(obs_tensor.unsqueeze(0), deterministic=True)
         buffer.compute_returns_and_advantages(last_value.squeeze(0), cfg.gamma, cfg.gae_lambda)
         advantages = buffer.advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if cfg.normalize_advantage:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         policy_losses = []
         value_losses = []
@@ -172,19 +202,45 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
                 entropies.append(float(entropy_loss.detach().cpu()))
                 kls.append(float(approx_kl.detach().cpu()))
         update += 1
+        validation_reward = float("nan")
+        if update % max(1, int(cfg.validation_every_updates)) == 0:
+            validation_reward = _validation_reward(model, args, cfg, device)
+            if validation_reward > best_validation_reward:
+                best_validation_reward = validation_reward
+                best_path = args.best_checkpoint_path or str(Path(args.checkpoint_path).with_name(Path(args.checkpoint_path).stem + "_best.pt"))
+                save_ppo_checkpoint(best_path, model, {"global_step": global_step, "update": update, "validation_reward": validation_reward}, optimizer)
         row = {
             "update": update,
             "global_step": global_step,
-            "mean_reward": float(np.mean(episode_rewards[-10:])) if episode_rewards else current_episode_reward,
+            "mean_reward": float(np.mean(recent_rewards)) if recent_rewards else 0.0,
+            "recent_success_ratio": float(np.mean(recent_successes)) if recent_successes else 0.0,
             "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
             "value_loss": float(np.mean(value_losses)) if value_losses else 0.0,
             "entropy": float(np.mean(entropies)) if entropies else 0.0,
             "approx_kl": float(np.mean(kls)) if kls else 0.0,
+            "validation_reward": validation_reward,
         }
         with log_path.open("a", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=list(row.keys()))
             writer.writerow(row)
         print(row)
+
+        if update % max(1, int(cfg.checkpoint_every_updates)) == 0:
+            save_ppo_checkpoint(
+                args.checkpoint_path,
+                model,
+                {
+                    "scenario_config": args.scenario_config,
+                    "global_step": global_step,
+                    "update": update,
+                    "best_validation_reward": best_validation_reward,
+                    "elapsed_training_s": monotonic() - started_at,
+                    "predictor_type": env.env_config.predictor_type,
+                },
+                optimizer,
+            )
+        if args.time_budget_hours is not None and monotonic() - started_at >= float(args.time_budget_hours) * 3600.0:
+            break
 
     metadata = {
         "scenario_config": args.scenario_config,
@@ -198,8 +254,13 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         "include_prediction": env.env_config.include_prediction,
         "learning_task_equivalent": int(global_step),
         "max_episode_tasks": env.env_config.max_episode_tasks if env.env_config.max_episode_tasks is not None else 0,
+        "best_validation_reward": best_validation_reward,
+        "elapsed_training_s": monotonic() - started_at,
     }
-    save_ppo_checkpoint(args.checkpoint_path, model, metadata)
+    save_ppo_checkpoint(args.checkpoint_path, model, metadata, optimizer)
+    best_path = args.best_checkpoint_path or str(Path(args.checkpoint_path).with_name(Path(args.checkpoint_path).stem + "_best.pt"))
+    if not Path(best_path).exists():
+        save_ppo_checkpoint(best_path, model, metadata, optimizer)
     env.close()
     result = {"checkpoint": args.checkpoint_path, "log_path": args.log_path, **metadata}
     result_path = Path(args.result_path)
@@ -211,7 +272,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario-config", default="configs/phase1_small.yaml")
+    parser.add_argument("--scenario-config", default="configs/scenario_b.yaml")
     parser.add_argument("--env-config", default="configs/rl_env.yaml")
     parser.add_argument("--ppo-config", default="configs/ppo.yaml")
     parser.add_argument("--checkpoint-path", default="data/generated/checkpoints/ppo.pt")
@@ -227,10 +288,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-type", default="")
     parser.add_argument("--predictor-checkpoint-path", default="")
     parser.add_argument("--predictor-model-config-path", default="")
+    parser.add_argument("--best-checkpoint-path", default="")
+    parser.add_argument("--time-budget-hours", type=float, default=None)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--static-weights", action="store_true")
     parser.add_argument("--no-fuzzy-weights", action="store_true")
     parser.add_argument("--no-prediction", action="store_true")
     return parser.parse_args()
+
+
+def _validation_reward(model: ActorCritic, args: argparse.Namespace, cfg: PPOTrainConfig, device: torch.device) -> float:
+    env_config, reward_config = split_env_reward_config(args.env_config, args)
+    env_config.max_episode_tasks = int(cfg.validation_tasks)
+    env = MECOffloadingEnv(args.scenario_config, env_config, reward_config)
+    obs, _ = env.reset(seed=int(cfg.validation_seed))
+    rewards = []
+    done = False
+    while not done:
+        with torch.no_grad():
+            tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            action, _, _, _ = model.get_action_and_value(tensor, deterministic=True)
+        obs, reward, terminated, truncated, _ = env.step(action.squeeze(0).cpu().numpy())
+        rewards.append(float(reward))
+        done = bool(terminated or truncated)
+    env.close()
+    return float(np.mean(rewards)) if rewards else -float("inf")
 
 
 if __name__ == "__main__":

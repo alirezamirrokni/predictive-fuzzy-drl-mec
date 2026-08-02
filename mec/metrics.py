@@ -19,6 +19,8 @@ class MetricRecord:
     latency_s: float
     energy_j: float
     reliability: float
+    reliability_satisfied: int
+    reliability_target: float
     success: int
     deadline_violation: int
     failed_due_to_battery: int
@@ -30,6 +32,9 @@ class MetricRecord:
     deadline_s: float = 0.0
     priority: int = 0
     arrival_time: int = 0
+    release_time_s: float = 0.0
+    release_interval_s: float = 0.0
+    task_local_fraction: float = 0.0
     tx_time_s: float = 0.0
     rx_time_s: float = 0.0
     queue_delay_s: float = 0.0
@@ -59,6 +64,8 @@ class MetricsLogger:
                 "average_latency_s": 0.0,
                 "average_energy_j": 0.0,
                 "average_reliability": 0.0,
+                "reliability_satisfaction_ratio": 0.0,
+                "total_energy_j": 0.0,
                 "deadline_violation_rate": 0.0,
                 "battery_failure_rate": 0.0,
                 "channel_failure_rate": 0.0,
@@ -69,6 +76,8 @@ class MetricsLogger:
                 "average_execution_overhead_s": 0.0,
                 "average_online_overhead_s": 0.0,
                 "total_online_overhead_s": 0.0,
+                "maximum_online_overhead_s": 0.0,
+                "maximum_execution_overhead_s": 0.0,
             }
         n = len(self.records)
         return {
@@ -76,7 +85,9 @@ class MetricsLogger:
             "success_ratio": sum(r.success for r in self.records) / n,
             "average_latency_s": mean(r.latency_s for r in self.records),
             "average_energy_j": mean(r.energy_j for r in self.records),
+            "total_energy_j": sum(r.energy_j for r in self.records),
             "average_reliability": mean(r.reliability for r in self.records),
+            "reliability_satisfaction_ratio": sum(r.reliability_satisfied for r in self.records) / n,
             "deadline_violation_rate": sum(r.deadline_violation for r in self.records) / n,
             "battery_failure_rate": sum(r.failed_due_to_battery for r in self.records) / n,
             "channel_failure_rate": sum(r.failed_due_to_channel for r in self.records) / n,
@@ -87,6 +98,8 @@ class MetricsLogger:
             "average_execution_overhead_s": mean(r.execution_overhead_s for r in self.records),
             "average_online_overhead_s": mean(r.online_overhead_s for r in self.records),
             "total_online_overhead_s": sum(r.online_overhead_s for r in self.records),
+            "maximum_online_overhead_s": max(r.online_overhead_s for r in self.records),
+            "maximum_execution_overhead_s": max(r.execution_overhead_s for r in self.records),
         }
 
     def to_csv(self, path: str | Path) -> None:

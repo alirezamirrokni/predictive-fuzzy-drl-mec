@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from predictors.gnn_predictor import GNNModelConfig, GNNPredictor, build_distance_adjacency, build_graph_windows
 from predictors.lstm_predictor import LSTMModelConfig, LSTMPredictor, build_sequence_windows
@@ -27,10 +29,9 @@ def test_gnn_predictor_forward_shape():
 
 
 def test_mec_env_reset_and_step():
-    import pytest
     pytest.importorskip("gymnasium")
     from rl.mec_env import MECEnvConfig, MECOffloadingEnv
-    env = MECOffloadingEnv("configs/phase1_small.yaml", MECEnvConfig(top_k=3, max_episode_tasks=5))
+    env = MECOffloadingEnv("configs/debug.yaml", MECEnvConfig(top_k=3, max_episode_tasks=5, include_prediction=False))
     observation, info = env.reset(seed=0)
     assert observation.shape == env.observation_space.shape
     action = env.action_space.sample()
@@ -39,4 +40,8 @@ def test_mec_env_reset_and_step():
     assert isinstance(float(reward), float)
     assert not truncated
     assert "success" in step_info
+    if not terminated:
+        task, device = env._current_task()
+        partial = env._decode_action(np.asarray([2, 0]), env._current_candidates(task, device), task)
+        assert partial.mode == "partial"
     env.close()

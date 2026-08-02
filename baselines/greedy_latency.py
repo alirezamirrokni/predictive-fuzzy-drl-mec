@@ -11,7 +11,7 @@ class GreedyLatencyPolicy:
     def choose(self, simulator, task, device) -> OffloadingDecision:
         best_decision = None
         best_value = float("inf")
-        for decision in simulator.all_candidate_decisions(self.include_partial, device, self.top_k):
+        for decision in simulator.all_candidate_decisions(self.include_partial, device, task, self.top_k):
             outcome = simulator.estimate(task, device, decision)
             value = outcome.latency_s
             if not outcome.success:

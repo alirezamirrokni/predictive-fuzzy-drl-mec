@@ -8,29 +8,32 @@ from .task import Task
 
 @dataclass(slots=True)
 class IoTDevice:
+    """IoT device whose physical fields come directly from the project table."""
+
     device_id: int
-    cpu_capacity_mips: float
-    battery_j: float
+    cpu_frequency_ghz: float
     tx_power_w: float
-    local_power_w: float
+    compute_power_w: float
+    reliability_target: float
     position: Tuple[float, float]
-    mobility_speed_mps: float
-    failure_probability: float
     task_queue: List[Task] = field(default_factory=list)
 
     def validate(self) -> None:
-        if self.cpu_capacity_mips <= 0:
-            raise ValueError("cpu_capacity_mips must be positive")
-        if self.battery_j < 0:
-            raise ValueError("battery_j must be non-negative")
-        if self.tx_power_w <= 0:
-            raise ValueError("tx_power_w must be positive")
-        if self.local_power_w <= 0:
-            raise ValueError("local_power_w must be positive")
-        if self.mobility_speed_mps < 0:
-            raise ValueError("mobility_speed_mps must be non-negative")
-        if not 0 <= self.failure_probability <= 1:
-            raise ValueError("failure_probability must be in [0, 1]")
+        if self.cpu_frequency_ghz <= 0:
+            raise ValueError("cpu_frequency_ghz must be positive")
+        if self.tx_power_w <= 0 or self.compute_power_w <= 0:
+            raise ValueError("power values must be positive")
+        if not 0.0 <= self.reliability_target <= 1.0:
+            raise ValueError("reliability_target must be in [0, 1]")
+
+    @property
+    def cpu_capacity_mips(self) -> float:
+        # One CPU cycle per instruction: 1 GHz == 1000 MIPS.
+        return self.cpu_frequency_ghz * 1000.0
+
+    @property
+    def local_power_w(self) -> float:
+        return self.compute_power_w
 
     def add_task(self, task: Task) -> None:
         if task.device_id != self.device_id:
@@ -38,13 +41,11 @@ class IoTDevice:
         self.task_queue.append(task)
 
     def pop_ready_tasks(self, time_slot: int) -> List[Task]:
-        ready = [task for task in self.task_queue if task.arrival_time <= time_slot]
-        self.task_queue = [task for task in self.task_queue if task.arrival_time > time_slot]
+        ready = [task for task in self.task_queue if task.arrival_slot <= time_slot]
+        self.task_queue = [task for task in self.task_queue if task.arrival_slot > time_slot]
         return ready
 
     def consume_energy(self, energy_j: float) -> None:
-        self.battery_j = max(0.0, self.battery_j - max(0.0, energy_j))
-
-    @property
-    def battery_empty(self) -> bool:
-        return self.battery_j <= 0
+        # Battery capacity is not specified in the document/table, so no invented
+        # battery constraint is introduced. Energy is measured, not subtracted.
+        _ = energy_j

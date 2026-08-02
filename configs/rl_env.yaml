@@ -1,24 +1,18 @@
-top_k: 5
+offloading_mode: mixed
+top_k: 16
 include_fuzzy_weights: true
-prediction_uncertainty: 0.0
-max_episode_tasks: 400
+include_prediction: true
+predictive_feature_size: 4
 predictor_type: none
 predictor_checkpoint_path: ""
 predictor_model_config_path: ""
-include_prediction: true
-predictive_feature_size: 10
-prediction_fallback_uncertainty: 0.5
+strict_predictor_loading: true
+predictor_fallback_permitted: false
+max_episode_tasks: null
 reward:
-  latency_normalizer: 10.0
-  energy_normalizer: 10.0
+  success_alpha: 1.0
+  energy_beta: 2.0
   deadline_penalty: 1.0
   failure_penalty: 1.0
-  battery_penalty: 0.5
-  channel_penalty: 0.5
-  server_penalty: 0.5
+  reliability_target_penalty: 0.5
   reward_clip: 10.0
-  use_static_weights: false
-  static_energy_weight: 0.25
-  static_latency_weight: 0.25
-  static_success_weight: 0.25
-  static_reliability_weight: 0.25

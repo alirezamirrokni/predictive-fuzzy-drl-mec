@@ -42,6 +42,7 @@ def summarize(step_rows: List[Dict[str, Any]], total_rewards: List[float]) -> Di
     latencies = [float(row.get("latency_s", 0.0)) for row in step_rows]
     energies = [float(row.get("energy_j", 0.0)) for row in step_rows]
     reliabilities = [float(row.get("reliability", 0.0)) for row in step_rows]
+    reliability_satisfied = [float(row.get("reliability_satisfied", 0.0)) for row in step_rows]
     deadline_violations = [float(row.get("deadline_violation", 0.0)) for row in step_rows]
     execution_overheads = [float(row.get("execution_overhead_s", 0.0)) for row in step_rows]
     online_overheads = [float(row.get("online_overhead_s", 0.0)) for row in step_rows]
@@ -52,11 +53,15 @@ def summarize(step_rows: List[Dict[str, Any]], total_rewards: List[float]) -> Di
         "success_ratio": float(np.mean(successes)) if successes else 0.0,
         "average_latency_s": float(np.mean(latencies)) if latencies else 0.0,
         "average_energy_j": float(np.mean(energies)) if energies else 0.0,
+        "total_energy_j": float(np.sum(energies)) if energies else 0.0,
         "average_reliability": float(np.mean(reliabilities)) if reliabilities else 0.0,
+        "reliability_satisfaction_ratio": float(np.mean(reliability_satisfied)) if reliability_satisfied else 0.0,
         "deadline_violation_rate": float(np.mean(deadline_violations)) if deadline_violations else 0.0,
         "average_execution_overhead_s": float(np.mean(execution_overheads)) if execution_overheads else 0.0,
         "average_online_overhead_s": float(np.mean(online_overheads)) if online_overheads else 0.0,
         "total_online_overhead_s": float(np.sum(online_overheads)) if online_overheads else 0.0,
+        "maximum_online_overhead_s": float(np.max(online_overheads)) if online_overheads else 0.0,
+        "maximum_execution_overhead_s": float(np.max(execution_overheads)) if execution_overheads else 0.0,
     }
 
 
@@ -75,13 +80,19 @@ def evaluate(args: argparse.Namespace) -> Dict[str, Any]:
     for episode in range(int(args.episodes)):
         env = MECOffloadingEnv(args.scenario_config, env_config, reward_config)
         obs, _ = env.reset(seed=int(args.seed) + episode)
+        if model is not None:
+            expected_actions = [int(v) for v in env.action_space.nvec.tolist()]
+            if model.config.observation_dim != len(obs) or list(model.config.action_dims) != expected_actions:
+                raise ValueError("PPO checkpoint schema does not match this scenario/environment configuration")
         done = False
         episode_reward = 0.0
         rng = np.random.default_rng(int(args.seed) + episode)
         while not done:
             action_start = perf_counter()
             if args.policy == "random":
-                action = env.action_space.sample()
+                action = np.asarray([rng.integers(0, 3), rng.integers(0, env.env_config.top_k)], dtype=np.int64)
+            elif args.policy == "local":
+                action = np.asarray([0, 0], dtype=np.int64)
             else:
                 with torch.no_grad():
                     obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -98,6 +109,11 @@ def evaluate(args: argparse.Namespace) -> Dict[str, Any]:
                 row["drl_overhead_s"] = policy_inference_overhead_s if args.policy == "ppo" else 0.0
                 row["policy_overhead_s"] = policy_inference_overhead_s
                 row["online_overhead_s"] = float(row.get("online_overhead_s", 0.0)) + policy_inference_overhead_s
+                if args.policy in {"random", "local"}:
+                    # These baselines do not own predictive/fuzzy layers.
+                    row["prediction_overhead_s"] = 0.0
+                    row["fuzzy_overhead_s"] = 0.0
+                    row["online_overhead_s"] = policy_inference_overhead_s + float(row.get("simulator_apply_overhead_s", 0.0))
                 step_rows.append(row)
         total_rewards.append(episode_reward)
         if env.simulator is not None:
@@ -123,8 +139,8 @@ def evaluate(args: argparse.Namespace) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", choices=["ppo", "random"], default="ppo")
-    parser.add_argument("--scenario-config", default="configs/phase1_small.yaml")
+    parser.add_argument("--policy", choices=["ppo", "random", "local"], default="ppo")
+    parser.add_argument("--scenario-config", default="configs/scenario_b.yaml")
     parser.add_argument("--env-config", default="configs/rl_env.yaml")
     parser.add_argument("--checkpoint-path", default="data/generated/checkpoints/ppo.pt")
     parser.add_argument("--episodes", type=int, default=3)

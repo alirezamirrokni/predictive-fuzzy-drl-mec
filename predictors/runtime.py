@@ -33,12 +33,12 @@ def current_system_features(simulator: MECSimulator, ready_task_rate: float = 0.
             float(np.mean(loads)) if loads.size else 0.0,
             float(np.max(loads)) if loads.size else 0.0,
             float(np.std(loads)) if loads.size else 0.0,
-            float(np.mean(queues)) if queues.size else 0.0,
+            float(np.mean(queues) / 1.5) if queues.size else 0.0,
             float(np.mean(reliability)) if reliability.size else 0.0,
-            float(np.mean(bandwidth) / 100.0) if bandwidth.size else 0.0,
+            float(np.mean(bandwidth) / 20.0) if bandwidth.size else 0.0,
             float(ready_task_rate),
-            float(summary.get("average_latency_s", 0.0)) / 10.0,
-            float(summary.get("average_energy_j", 0.0)) / 10.0,
+            float(summary.get("average_latency_s", 0.0)) / 1.5,
+            float(summary.get("average_energy_j", 0.0)) / 0.05,
             float(summary.get("success_ratio", 0.0)),
         ],
         dtype=np.float32,
@@ -62,7 +62,7 @@ def aggregate_gnn_prediction(prediction: np.ndarray, simulator: MECSimulator) ->
             float(np.std(load_col)) if load_col.size else 0.0,
             float(np.mean(queue_col)) if queue_col.size else 0.0,
             float(np.mean(reliability)) if reliability.size else 0.0,
-            float(np.mean(bandwidth) / 100.0) if bandwidth.size else 0.0,
+            float(np.mean(bandwidth) / 20.0) if bandwidth.size else 0.0,
             0.0,
             0.0,
             0.0,
@@ -78,7 +78,8 @@ class PredictiveConfig:
     checkpoint_path: str = ""
     model_config_path: str = ""
     feature_size: int = 10
-    fallback_uncertainty: float = 0.5
+    strict_loading: bool = True
+    fallback_permitted: bool = False
     device: str = ""
 
 
@@ -92,12 +93,7 @@ class PredictiveSnapshot:
 
 
 class PredictiveFeatureProvider:
-    """Runtime adapter that converts LSTM/GNN predictors into a fixed-size state vector.
-
-    If no checkpoint is available, it returns a safe current-state fallback instead of
-    crashing. That keeps experiments runnable while still using real checkpoints as soon
-    as they are trained.
-    """
+    """Runtime predictor adapter with fail-fast production loading."""
 
     def __init__(self, config: PredictiveConfig | None = None) -> None:
         self.config = PredictiveConfig() if config is None else config
@@ -116,6 +112,8 @@ class PredictiveFeatureProvider:
             return
         checkpoint_path = Path(self.config.checkpoint_path) if self.config.checkpoint_path else Path("")
         if not checkpoint_path.exists() or not checkpoint_path.is_file():
+            if self.config.strict_loading:
+                raise FileNotFoundError(f"required {self.predictor_type} predictor checkpoint not found: {checkpoint_path}")
             return
         try:
             if self.predictor_type == "lstm":
@@ -131,11 +129,20 @@ class PredictiveFeatureProvider:
             self.model = None
             self.model_checkpoint = {}
             self.loaded = False
-        if self.config.model_config_path and Path(self.config.model_config_path).exists():
-            try:
-                self.model_config = load_yaml(self.config.model_config_path)
-            except Exception:
-                self.model_config = {}
+            if self.config.strict_loading:
+                raise
+        if self.config.model_config_path:
+            model_config_path = Path(self.config.model_config_path)
+            if not model_config_path.exists():
+                if self.config.strict_loading:
+                    raise FileNotFoundError(f"required predictor model config not found: {model_config_path}")
+            else:
+                try:
+                    self.model_config = load_yaml(model_config_path)
+                except Exception:
+                    self.model_config = {}
+                    if self.config.strict_loading:
+                        raise
 
     def reset(self) -> None:
         self.history.clear()
@@ -154,7 +161,9 @@ class PredictiveFeatureProvider:
         if self.predictor_type == "none":
             return self._snapshot(fallback, 0.0, "none", True)
         if self.model is None or not self.loaded:
-            return self._snapshot(fallback, float(self.config.fallback_uncertainty), f"{self.predictor_type}_fallback", False)
+            if not self.config.fallback_permitted:
+                raise RuntimeError(f"{self.predictor_type} predictor is unavailable and fallback is disabled")
+            return self._snapshot(fallback, 1.0, f"{self.predictor_type}_fallback", False)
         try:
             if self.predictor_type == "lstm":
                 vector = self._predict_lstm(fallback)
@@ -165,7 +174,9 @@ class PredictiveFeatureProvider:
             uncertainty = self._estimate_uncertainty(vector, fallback)
             return self._snapshot(vector, uncertainty, self.predictor_type, True)
         except Exception:
-            return self._snapshot(fallback, float(self.config.fallback_uncertainty), f"{self.predictor_type}_fallback", False)
+            if not self.config.fallback_permitted:
+                raise
+            return self._snapshot(fallback, 1.0, f"{self.predictor_type}_fallback", False)
 
     def _predict_lstm(self, fallback: np.ndarray) -> np.ndarray:
         lookback = int(self.model_config.get("lookback_window", 10)) if self.model_config else 10
@@ -212,6 +223,9 @@ class PredictiveFeatureProvider:
     def _estimate_uncertainty(self, vector: np.ndarray, fallback: np.ndarray) -> float:
         v = self._fit_vector(vector, fallback)
         f = self._fit_vector(fallback, fallback)
+        checkpoint_loss = self.model_checkpoint.get("best_val_loss")
+        if checkpoint_loss is not None:
+            return float(max(0.0, min(1.0, np.sqrt(max(0.0, float(checkpoint_loss))))))
         error = float(np.mean(np.abs(v - f)))
         return float(max(0.0, min(1.0, error)))
 

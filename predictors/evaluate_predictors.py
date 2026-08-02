@@ -43,6 +43,11 @@ def default_result_path(model_name: str, scenario_config: str, output_dir: str, 
     return output / f"{model_name}_eval.json"
 
 
+def chronological_validation(x: np.ndarray, y: np.ndarray, fraction: float) -> tuple[np.ndarray, np.ndarray]:
+    size = max(1, int(len(x) * float(fraction)))
+    return x[-size:], y[-size:]
+
+
 def evaluate_lstm(args: argparse.Namespace) -> Dict[str, Any]:
     config = load_lstm_yaml(args.model_config)
     trace, cache_path = load_or_create_lstm_cache(args.scenario_config, config, args.cache_dir, False)
@@ -53,6 +58,7 @@ def evaluate_lstm(args: argparse.Namespace) -> Dict[str, Any]:
         int(config.get("prediction_horizon", 1)),
         target_size=target_size,
     )
+    x, y = chronological_validation(x, y, float(config.get("validation_fraction", 0.2)))
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     model, checkpoint = load_lstm_checkpoint(args.checkpoint_path, map_location=device)
     model = model.to(device)
@@ -82,6 +88,7 @@ def evaluate_gnn(args: argparse.Namespace) -> Dict[str, Any]:
         int(config.get("prediction_horizon", 1)),
         target_columns=tuple(config.get("target_columns", [0, 1])),
     )
+    x, y = chronological_validation(x, y, float(config.get("validation_fraction", 0.2)))
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     adjacency = torch.as_tensor(
         build_distance_adjacency(positions, int(config.get("k_neighbors", 5))),
@@ -110,7 +117,7 @@ def evaluate_gnn(args: argparse.Namespace) -> Dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["lstm", "gnn"], required=True)
-    parser.add_argument("--scenario-config", default="configs/phase1_small.yaml")
+    parser.add_argument("--scenario-config", default="configs/scenario_b.yaml")
     parser.add_argument("--model-config", default="")
     parser.add_argument("--checkpoint-path", default="")
     parser.add_argument("--cache-dir", default="data/generated")

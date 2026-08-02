@@ -17,5 +17,4 @@ class RandomPolicy:
         server = simulator.servers[int(simulator.rng.integers(0, len(simulator.servers)))]
         if mode == "edge":
             return OffloadingDecision("edge", server.server_id, 1.0)
-        ratio = float(simulator.rng.choice([0.25, 0.5, 0.75]))
-        return OffloadingDecision("partial", server.server_id, ratio)
+        return OffloadingDecision("partial", server.server_id, 1.0 - task.local_fraction)

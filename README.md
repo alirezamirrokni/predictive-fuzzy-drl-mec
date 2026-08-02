@@ -1,164 +1,100 @@
-# Predictive-Fuzzy-DRL MEC
+# DRL–Fuzzy–Predictive MEC (final corrected implementation)
 
-This repository implements a Mobile Edge Computing task-offloading framework with:
+This repository implements the requested three-layer framework with two fair predictive variants:
 
-- MEC simulator with local, binary edge, and partial offloading
-- heuristic baselines
-- fuzzy controller and fuzzy reward weighting
-- LSTM predictive layer
-- GNN predictive baseline layer
-- Gymnasium MEC environment
-- pure PyTorch PPO training and evaluation
-- scenario, ablation, sensitivity, and plotting scripts
+- **LSTM + fixed fuzzy controller + feed-forward PPO** (proposed method)
+- **GNN/GAT + the same fixed fuzzy controller + the same feed-forward PPO** (predictive baseline)
+- **Local only**
+- **Random mixed offloading**
+
+Only these four methods appear in the production experiment and comparison plots. Greedy latency is used only to generate supervised predictor traces; it is not an evaluation baseline.
+
+## What is fixed
+
+- Scenario A samples one IoT population size uniformly from **600–1000** per replication and uses **100** heterogeneous edge servers.
+- Scenario B uses **300** IoT devices and samples one edge-server population size uniformly from **30–100** per replication.
+- Every device/server/task attribute is sampled independently from the full documented interval. A run does not create one separate experiment for every value.
+- Every sampled IoT device receives exactly **200 tasks**.
+- The production clock is EdgeSimPy v1.1.0. Production fails if EdgeSimPy is absent; only `configs/debug.yaml` permits the internal test clock.
+- Offloading is always `mixed`: local, full edge, or partial. For a partial decision, the task's sampled `local_fraction` is local and `1-local_fraction` is offloaded.
+- LSTM and GNN use identical tasks, seeds, top-16 candidates, fuzzy rules, PPO architecture/budget, and evaluation seeds.
+- Predictor loading is strict. Production evaluation never replaces a missing/broken predictor with current-state features.
+- Predictor validation is chronological, with a 16-window separation gap and early stopping on lowest validation MSE.
+- PPO saves a recoverable checkpoint after every update and selects a separate best checkpoint by a fixed validation seed, never by test results.
+- PPO state includes four forecast features and four fuzzy weights. PPO itself is feed-forward, not recurrent.
+- GAE episode masking is corrected; reset seeds now actually change the sampled scenario.
+- Outputs include energy, latency, success ratio, average reliability, reliability-target satisfaction, task modes/specifications, and mean/maximum overhead.
 
 ## Install
+
+Python 3.10+ is recommended.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Windows PowerShell:
+EdgeSimPy is pinned to its stable v1.1.0 Git tag in `requirements.txt`.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
+## Fast verification
 
-## Quick tests
+The debug configuration keeps the same physical ranges but deliberately uses only 5 devices, 3 servers, and 4 tasks/device:
 
 ```bash
 PYTHONPATH=. pytest -q
+PYTHONPATH=. python main.py --config configs/debug.yaml --policy random --output-dir data/results/debug
 ```
 
-Windows PowerShell:
+Debug results are not valid project results.
 
-```powershell
-$env:PYTHONPATH="."
-pytest -q
-```
-
-## Train predictors
+## Full production run (both scenarios, approximately one day)
 
 ```bash
-PYTHONPATH=. python -m predictors.train_lstm --scenario-config configs/phase1_small.yaml --restart
-PYTHONPATH=. python -m predictors.train_gnn --scenario-config configs/phase1_small.yaml --restart
+bash scripts/run_colab_project.sh
 ```
 
-## Evaluate predictors
+The script trains both predictors and all four scenario/model PPO combinations. Each PPO job is capped at five wall-clock hours and at 1,048,576 environment steps, so the complete workflow targets roughly 24 hours; exact duration depends on CPU/GPU and EdgeSimPy overhead. Predictor early stopping can finish before 200 epochs.
+
+Equivalent command:
 
 ```bash
-PYTHONPATH=. python -m predictors.evaluate_predictors --model lstm --scenario-config configs/phase1_small.yaml
-PYTHONPATH=. python -m predictors.evaluate_predictors --model gnn --scenario-config configs/phase1_small.yaml
+PYTHONPATH=. python -m experiments.run_full_pipeline \
+  --scenario both \
+  --train-predictors \
+  --force-train \
+  --total-timesteps 1048576 \
+  --episodes 8 \
+  --time-budget-hours-per-model 5
 ```
 
-## Train PPO without predictor
+Do not set `--max-episode-tasks` for final results. That option exists only for smoke runs.
+
+## Short smoke run of the learning pipeline
+
+After installing PyTorch, Gymnasium, and EdgeSimPy:
 
 ```bash
-PYTHONPATH=. python -m rl.train_ppo \
-  --scenario-config configs/phase1_small.yaml \
-  --checkpoint-path data/generated/checkpoints/no_prediction_drl.pt \
-  --no-prediction \
-  --total-timesteps 10000 \
-  --max-episode-tasks 400
+PYTHONPATH=. python -m predictors.train_lstm --scenario-config configs/debug.yaml --epochs 2 --restart
+PYTHONPATH=. python -m predictors.train_gnn --scenario-config configs/debug.yaml --epochs 2 --restart
 ```
 
-## Train static-weight PPO baseline
+For PPO smoke tests, point the commands in `COMMANDS.md` to `configs/debug.yaml`, use `--total-timesteps 2048`, and use the debug predictor checkpoints. Never mix debug checkpoints with production evaluation.
 
-```bash
-PYTHONPATH=. python -m rl.train_ppo \
-  --scenario-config configs/phase1_small.yaml \
-  --checkpoint-path data/generated/checkpoints/static_weight_drl.pt \
-  --static-weights \
-  --no-prediction \
-  --total-timesteps 10000 \
-  --max-episode-tasks 400
-```
+## Outputs
 
-## Train LSTM-Fuzzy-PPO
+For each scenario, the pipeline writes:
 
-```bash
-PYTHONPATH=. python -m rl.train_ppo \
-  --scenario-config configs/phase1_small.yaml \
-  --checkpoint-path data/generated/checkpoints/lstm_fuzzy_drl.pt \
-  --predictor-type lstm \
-  --predictor-checkpoint-path data/generated/checkpoints/lstm_best.pt \
-  --predictor-model-config-path configs/model_lstm.yaml \
-  --total-timesteps 10000 \
-  --max-episode-tasks 400
-```
+- `data/results/scenario_*/{lstm_fuzzy_drl,gnn_fuzzy_drl,local_only,random}_eval.json`
+- one per-task metrics CSV per method
+- predictor/PPO training logs and summaries
+- `reports/figures/scenario_*/comparison/` with separate requested comparison charts
+- per-method task-mode and task-specification charts
+- mean online overhead, maximum online overhead, per-task overhead, and learning-overhead charts
 
-## Train GNN-Fuzzy-PPO baseline
+## Fairness and interpretation
 
-```bash
-PYTHONPATH=. python -m rl.train_ppo \
-  --scenario-config configs/phase1_small.yaml \
-  --checkpoint-path data/generated/checkpoints/gnn_fuzzy_drl.pt \
-  --predictor-type gnn \
-  --predictor-checkpoint-path data/generated/checkpoints/gnn_best.pt \
-  --predictor-model-config-path configs/model_gnn.yaml \
-  --total-timesteps 10000 \
-  --max-episode-tasks 400
-```
+The code does not alter metrics, rewards, failures, or test samples to force LSTM to win. The selected hyperparameters are strong, symmetric choices; best PPO checkpoints are chosen on a fixed validation workload. LSTM is expected to benefit from the explicitly temporal global trace, but **no scientifically valid implementation can guarantee that it wins every metric before the experiment is run**. If it does not, report that result and tune only with predictor/PPO validation data—not the final evaluation seeds.
 
-## Evaluate a PPO checkpoint
-
-```bash
-PYTHONPATH=. python -m rl.evaluate_policy \
-  --policy ppo \
-  --scenario-config configs/phase1_small.yaml \
-  --checkpoint-path data/generated/checkpoints/lstm_fuzzy_drl.pt \
-  --output data/results/lstm_fuzzy_drl_eval.json \
-  --metrics-csv data/results/lstm_fuzzy_drl_metrics.csv \
-  --deterministic
-```
-
-## Run scenario scripts
-
-```bash
-PYTHONPATH=. python -m experiments.run_scenario_a --train-predictors --total-timesteps 10000 --max-episode-tasks 2000
-PYTHONPATH=. python -m experiments.run_scenario_b --train-predictors --total-timesteps 10000 --max-episode-tasks 2000
-```
-
-## Run ablation and sensitivity
-
-```bash
-PYTHONPATH=. python -m experiments.run_ablation --total-timesteps 5000
-PYTHONPATH=. python -m experiments.run_sensitivity
-```
-
-## Generate plots
-
-```bash
-PYTHONPATH=. python -m plots.generate_all_plots --results-dir data/results --figures-dir reports/figures
-```
-
-## Full pipeline
-
-```bash
-PYTHONPATH=. python -m experiments.run_full_pipeline --scenario both --train-predictors --total-timesteps 10000 --max-episode-tasks 2000
-```
-
-For quick debugging, reduce `--total-timesteps` and `--max-episode-tasks`.
-
-## Added completion notes
-
-This completed version adds:
-
-- fixed YAML loading for scenario files
-- scenario configurations for `scenario_a_600`, `scenario_a_1000`, `scenario_b_30`, and `scenario_b_100`
-- a centralized `configs/rasoul_reference.yaml` for MEC/RASOUL-style variables
-- per-task task-specification logging in every metrics CSV
-- per-task execution overhead logging until task exit: transmission, reception, and queue delay
-- online runtime overhead logging for predictor, fuzzy reward, simulator apply, policy, and DRL action inference
-- learning overhead summaries in task-equivalent steps
-- separate plotting commands for energy, latency, success ratio, reliability, task specifications, and overhead
-
-Full Colab commands are in [`COLAB_COMMANDS.md`](COLAB_COMMANDS.md). A shortcut script is available:
-
-```bash
-bash scripts/run_colab_project.sh configs/scenario_a_600.yaml data/results/scenario_a_600 10 2000 2000 3
-bash scripts/run_colab_project.sh configs/scenario_b_30.yaml data/results/scenario_b_30 10 2000 2000 3
-```
+See `docs/PARAMETER_AUDIT.md` for the source and units of every physical value, `docs/MODEL_AND_FORMULAS.md` for equations, and `COMMANDS.md` for individual commands.

@@ -11,10 +11,11 @@ def main() -> None:
     parser.add_argument("--scenario", choices=["a", "b", "both"], default="both")
     parser.add_argument("--train-predictors", action="store_true")
     parser.add_argument("--force-train", action="store_true")
-    parser.add_argument("--total-timesteps", type=int, default=10000)
-    parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--max-episode-tasks", type=int, default=2000)
+    parser.add_argument("--total-timesteps", type=int, default=1048576)
+    parser.add_argument("--episodes", type=int, default=8)
+    parser.add_argument("--max-episode-tasks", type=int, default=None)
     parser.add_argument("--predictor-epochs", type=int, default=None)
+    parser.add_argument("--time-budget-hours-per-model", type=float, default=5.0)
     args = parser.parse_args()
     targets = []
     if args.scenario in {"a", "both"}:
@@ -32,15 +33,17 @@ def main() -> None:
             str(args.total_timesteps),
             "--episodes",
             str(args.episodes),
-            "--max-episode-tasks",
-            str(args.max_episode_tasks),
         ]
+        if args.max_episode_tasks is not None:
+            cmd += ["--max-episode-tasks", str(args.max_episode_tasks)]
         if args.train_predictors:
             cmd.append("--train-predictors")
         if args.force_train:
             cmd.append("--force-train")
         if args.predictor_epochs is not None:
             cmd += ["--predictor-epochs", str(args.predictor_epochs)]
+        if args.time_budget_hours_per_model is not None:
+            cmd += ["--time-budget-hours-per-model", str(args.time_budget_hours_per_model)]
         call(cmd)
     call([sys.executable, "-m", "plots.generate_all_plots", "--results-dir", "data/results", "--figures-dir", "reports/figures"])
 

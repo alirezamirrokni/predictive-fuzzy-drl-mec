@@ -17,7 +17,9 @@ TASK_COLUMNS = {
     "output_size_mb": ("Task output size (MB)", "task_output_size"),
     "cpu_cycles_mi": ("Task CPU demand (MI)", "task_cpu_cycles"),
     "deadline_s": ("Task deadline (s)", "task_deadline"),
-    "priority": ("Task priority", "task_priority"),
+    "task_local_fraction": ("Fraction processed locally", "task_local_fraction"),
+    "release_interval_s": ("Task release interval (s)", "task_release_interval"),
+    "reliability_target": ("IoT reliability target", "device_reliability_target"),
 }
 
 
@@ -46,7 +48,7 @@ def plot(input_path: str, output_dir: str) -> list[Path]:
             continue
         path = output / f"{stem}_{suffix}.png"
         plt.figure(figsize=(6, 4))
-        bins = min(40, max(5, int(len(set(values))))) if column == "priority" else 40
+        bins = 40
         plt.hist(values, bins=bins)
         plt.xlabel(xlabel)
         plt.ylabel("Tasks")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -30,45 +31,35 @@ def collect_system_trace(config: Dict[str, Any], top_k: int = 5) -> np.ndarray:
     policy = GreedyLatencyPolicy(include_partial=True, top_k=top_k)
     rows = []
     for time_slot in range(simulator.time_slots):
-        before_records = len(simulator.metrics.records)
-        for server in simulator.servers:
-            server.process_slot(simulator.slot_duration_s)
-        for device in simulator.devices:
-            simulator.mobility.update(device, simulator.rng, simulator.slot_duration_s)
+        simulator.advance_to(time_slot)
         ready_count = 0
+        ready = []
         for device in simulator.devices:
             ready_tasks = device.pop_ready_tasks(time_slot)
             ready_count += len(ready_tasks)
-            for task in ready_tasks:
-                decision = policy.choose(simulator, task, device)
-                simulator.apply(time_slot, task, device, decision)
-        new_records = simulator.metrics.records[before_records:]
+            ready.extend((task, device) for task in ready_tasks)
         loads = np.array([server.queue_workload_mi / max(server.cpu_capacity_mips, 1e-9) for server in simulator.servers], dtype=np.float32)
         queue_delays = np.array([server.queue_delay() for server in simulator.servers], dtype=np.float32)
         reliability = np.array([server.reliability for server in simulator.servers], dtype=np.float32)
         bandwidth = np.array([server.bandwidth_mhz for server in simulator.servers], dtype=np.float32)
-        if new_records:
-            latency = float(np.mean([record.latency_s for record in new_records]))
-            energy = float(np.mean([record.energy_j for record in new_records]))
-            success = float(np.mean([record.success for record in new_records]))
-        else:
-            latency = 0.0
-            energy = 0.0
-            success = 0.0
+        summary = simulator.metrics.summary()
         rows.append(
             [
                 float(np.mean(loads)),
                 float(np.max(loads)),
                 float(np.std(loads)),
-                float(np.mean(queue_delays)),
+                float(np.mean(queue_delays) / 1.5),
                 float(np.mean(reliability)),
-                float(np.mean(bandwidth) / 100.0),
+                float(np.mean(bandwidth) / 20.0),
                 float(ready_count / max(1, len(simulator.devices))),
-                latency / 10.0,
-                energy / 10.0,
-                success,
+                float(summary.get("average_latency_s", 0.0)) / 1.5,
+                float(summary.get("average_energy_j", 0.0)) / 0.05,
+                float(summary.get("success_ratio", 0.0)),
             ]
         )
+        for task, device in ready:
+            decision = policy.choose(simulator, task, device)
+            simulator.apply(time_slot, task, device, decision)
     return np.asarray(rows, dtype=np.float32)
 
 
@@ -78,10 +69,11 @@ def load_or_create_cache(scenario_config_path: str | Path, model_config: Dict[st
     cache_dir.mkdir(parents=True, exist_ok=True)
     scenario = load_yaml_config(scenario_config_path)
     scenario_name = str(scenario.get("scenario_name", scenario_config_path.stem))
-    cache_path = cache_dir / f"{scenario_name}_lstm_trace.npz"
+    fingerprint = hashlib.sha256(json.dumps({"scenario": scenario, "trace_candidates": model_config.get("trace_candidate_count", 8)}, sort_keys=True).encode()).hexdigest()[:12]
+    cache_path = cache_dir / f"{scenario_name}_lstm_trace_{fingerprint}.npz"
     if cache_path.exists() and not force_rebuild:
         return np.load(cache_path)["trace"].astype(np.float32), cache_path
-    trace = collect_system_trace(scenario, top_k=int(model_config.get("top_k", 5)))
+    trace = collect_system_trace(scenario, top_k=int(model_config.get("trace_candidate_count", 8)))
     np.savez_compressed(cache_path, trace=trace, scenario_name=scenario_name)
     return trace, cache_path
 
@@ -94,16 +86,25 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     np.random.seed(int(model_config.get("seed", 0)))
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     trace, cache_path = load_or_create_cache(args.scenario_config, model_config, args.cache_dir, args.rebuild_cache)
+    expected_features = int(model_config.get("input_feature_count", 10))
+    if trace.shape[1] != expected_features:
+        raise ValueError(f"LSTM trace has {trace.shape[1]} features; expected {expected_features}")
     lookback = int(model_config.get("lookback_window", 10))
     horizon = int(model_config.get("prediction_horizon", 1))
     target_size = int(model_config.get("target_size", trace.shape[1]))
     x, y = build_sequence_windows(trace, lookback, horizon, target_size=target_size)
     dataset = SequenceWindowDataset(x, y)
     scenario_dict = load_yaml_config(args.scenario_config)
-    physical_task_count = int(scenario_dict["devices"]["count"]) * int(scenario_dict["tasks"]["tasks_per_device"])
+    raw_count = scenario_dict["devices"]["count"]
+    physical_task_count = int(max(raw_count) if isinstance(raw_count, list) else raw_count) * int(scenario_dict["tasks"]["tasks_per_device"])
     val_size = max(1, int(len(dataset) * float(model_config.get("validation_fraction", 0.2))))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(int(model_config.get("seed", 0))))
+    gap = int(model_config.get("separation_gap_windows", lookback))
+    split = len(dataset) - val_size
+    train_end = split - gap
+    if train_end <= 0:
+        raise ValueError("trace is too short for chronological validation plus separation gap")
+    train_dataset = torch.utils.data.Subset(dataset, range(0, train_end))
+    val_dataset = torch.utils.data.Subset(dataset, range(split, len(dataset)))
     train_loader = DataLoader(train_dataset, batch_size=int(model_config.get("batch_size", 32)), shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=int(model_config.get("batch_size", 32)), shuffle=False)
     config = LSTMModelConfig(
@@ -134,6 +135,9 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             writer.writeheader()
     epochs = int(model_config.get("epochs", 50))
     metadata = {"cache_path": str(cache_path), "scenario_config": str(args.scenario_config), "model_config": str(args.model_config)}
+    patience = int(model_config.get("early_stopping_patience", 20))
+    stale_epochs = 0
+    completed_epochs = start_epoch
     for epoch in range(start_epoch, epochs):
         model.train()
         train_losses = []
@@ -160,17 +164,23 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             writer.writerow({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
         if val_loss <= best_val_loss:
             best_val_loss = val_loss
+            stale_epochs = 0
             save_lstm_checkpoint(args.best_checkpoint_path, model, optimizer, epoch, best_val_loss, metadata)
+        else:
+            stale_epochs += 1
         save_lstm_checkpoint(checkpoint_path, model, optimizer, epoch, best_val_loss, metadata)
+        completed_epochs = epoch + 1
+        if stale_epochs >= patience:
+            break
     result = {
         "checkpoint": str(checkpoint_path),
         "best_checkpoint": str(args.best_checkpoint_path),
         "cache": str(cache_path),
         "best_val_loss": best_val_loss,
-        "epochs": int(epochs),
+        "epochs": int(completed_epochs),
         "num_windows": int(len(dataset)),
         "physical_task_count": int(physical_task_count),
-        "learning_task_equivalent": int(len(dataset) * int(epochs)),
+        "learning_task_equivalent": int(len(train_dataset) * int(completed_epochs)),
     }
     result_path = Path(args.result_path)
     result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +191,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario-config", default="configs/phase1_small.yaml")
+    parser.add_argument("--scenario-config", default="configs/scenario_b.yaml")
     parser.add_argument("--model-config", default="configs/model_lstm.yaml")
     parser.add_argument("--cache-dir", default="data/generated")
     parser.add_argument("--checkpoint-path", default="data/generated/checkpoints/lstm_last.pt")

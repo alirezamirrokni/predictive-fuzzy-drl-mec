@@ -177,8 +177,10 @@ class FuzzyController:
         local_latency = task.cpu_cycles_mi / device.cpu_capacity_mips
         latency_pressure = local_latency / max(task.deadline_s, 1e-9)
 
-        estimated_local_energy = device.local_power_w * local_latency
-        energy_pressure = estimated_local_energy / max(device.battery_j, 1e-9)
+        estimated_local_energy = device.compute_power_w * local_latency
+        # Relative energy pressure without inventing a battery-capacity parameter.
+        maximum_table_energy = 0.010 * (2500.0 / 500.0)
+        energy_pressure = estimated_local_energy / max(maximum_table_energy, 1e-9)
 
         if servers:
             load_values = []

@@ -11,38 +11,25 @@ from mec.task import Task
 
 @dataclass(slots=True)
 class CandidateSelectorConfig:
-    top_k: int = 5
-    queue_weight: float = 1.0
-    distance_weight: float = 1.0
-    cpu_weight: float = 0.5
-    bandwidth_weight: float = 0.3
-    reliability_weight: float = 0.5
+    top_k: int = 16
 
 
 class CandidateSelector:
+    """Deterministic, information-only preselection shared by both DRL methods."""
+
     def __init__(self, config: CandidateSelectorConfig | None = None) -> None:
         self.config = CandidateSelectorConfig() if config is None else config
 
     def score(self, simulator: MECSimulator, device: IoTDevice, server: EdgeServer) -> float:
-        distance = simulator.channel.distance_m(device.position, server.position)
-        area_diag = max(1.0, (simulator.mobility.area_width_m ** 2 + simulator.mobility.area_height_m ** 2) ** 0.5)
-        queue = server.queue_delay()
-        distance_term = distance / area_diag
-        cpu_term = server.cpu_capacity_mips / 30000.0
-        bandwidth_term = server.bandwidth_mhz / 100.0
-        reliability_term = server.reliability
-        return (
-            self.config.queue_weight * queue
-            + self.config.distance_weight * distance_term
-            - self.config.cpu_weight * cpu_term
-            - self.config.bandwidth_weight * bandwidth_term
-            - self.config.reliability_weight * reliability_term
-        )
+        rate = simulator.channel.data_rate_mbps(server.bandwidth_mhz, device.tx_power_w, device.device_id, server.server_id)
+        load = server.queue_workload_mi / max(server.cpu_capacity_mips, 1e-9)
+        # Lower is better. Terms are normalized only by documented maxima.
+        return load + server.queue_delay() / 1.5 - server.availability - server.cpu_frequency_ghz / 10.0 - rate / 500.0
 
     def select(self, simulator: MECSimulator, task: Task, device: IoTDevice) -> List[EdgeServer]:
+        _ = task
         servers = sorted(simulator.servers, key=lambda server: self.score(simulator, device, server))
-        k = max(1, min(int(self.config.top_k), len(servers)))
-        return servers[:k]
+        return servers[: max(1, min(int(self.config.top_k), len(servers)))]
 
     def pad(self, servers: Sequence[EdgeServer]) -> List[EdgeServer]:
         if not servers:

@@ -117,6 +117,27 @@ def plot_online_comparison(results_dir: str | Path, output_path: str | Path) -> 
     return out
 
 
+def plot_maximum_comparison(results_dir: str | Path, output_path: str | Path) -> Path | None:
+    results = Path(results_dir)
+    items: list[tuple[str, float]] = []
+    for csv_path in sorted(results.rglob("*_metrics.csv")):
+        values = _values(read_metrics(csv_path), "online_overhead_s")
+        if values:
+            items.append((_label_from_path(csv_path), float(np.max(values))))
+    if not items:
+        return None
+    labels, values = zip(*items)
+    out = Path(output_path)
+    plt.figure(figsize=(max(8, len(labels) * 0.8), 4))
+    plt.bar(labels, values)
+    plt.ylabel("Maximum online overhead (s/task)")
+    plt.xticks(rotation=35, ha="right")
+    plt.tight_layout()
+    plt.savefig(ensure_parent(out), dpi=200)
+    plt.close()
+    return out
+
+
 def _learning_equivalent_from_json(path: Path) -> float:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -168,6 +189,9 @@ def generate(results_dir: str, figures_dir: str) -> list[Path]:
         if breakdown is not None:
             produced.append(breakdown)
     item = plot_online_comparison(results, figures / "overhead_online_comparison.png")
+    if item is not None:
+        produced.append(item)
+    item = plot_maximum_comparison(results, figures / "overhead_maximum_comparison.png")
     if item is not None:
         produced.append(item)
     item = plot_learning_overhead(results, figures / "overhead_learning_task_equivalent.png")

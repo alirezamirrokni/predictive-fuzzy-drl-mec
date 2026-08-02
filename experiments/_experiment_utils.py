@@ -6,21 +6,10 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-from main import run as run_heuristic
 from mec.simulator import load_yaml_config
 
 
 DRL_METHODS = {
-    "no_prediction_drl": {
-        "predictor_type": "none",
-        "extra_train": ["--no-prediction"],
-        "extra_eval": ["--no-prediction"],
-    },
-    "static_weight_drl": {
-        "predictor_type": "none",
-        "extra_train": ["--static-weights", "--no-prediction"],
-        "extra_eval": ["--static-weights", "--no-prediction"],
-    },
     "lstm_fuzzy_drl": {
         "predictor_type": "lstm",
         "predictor_config": "configs/model_lstm.yaml",
@@ -48,6 +37,10 @@ def checkpoint_for(method: str, scenario_config: str) -> Path:
     return Path("data/generated/checkpoints") / f"{method}_{scenario_name(scenario_config)}.pt"
 
 
+def best_checkpoint_for(method: str, scenario_config: str) -> Path:
+    return Path("data/generated/checkpoints") / f"{method}_{scenario_name(scenario_config)}_best.pt"
+
+
 def predictor_checkpoint_for(kind: str, scenario_config: str, best: bool = True) -> Path:
     suffix = "best" if best else "last"
     return Path("data/generated/checkpoints") / f"{kind}_{scenario_name(scenario_config)}_{suffix}.pt"
@@ -58,9 +51,21 @@ def call(args: List[str]) -> None:
     subprocess.run(args, check=True)
 
 
-def run_heuristics(config_path: str, output_dir: str, policies: Iterable[str] = ("local_only", "random", "greedy_latency", "greedy_energy")) -> None:
-    for policy in policies:
-        run_heuristic(config_path, policy, output_dir)
+def evaluate_simple_baselines(config_path: str, output_dir: str, episodes: int, max_episode_tasks: int | None, seed: int = 100) -> None:
+    for label, policy in [("local_only", "local"), ("random", "random")]:
+        args = [
+            sys.executable, "-m", "rl.evaluate_policy",
+            "--policy", policy,
+            "--scenario-config", config_path,
+            "--output", str(Path(output_dir) / f"{label}_eval.json"),
+            "--metrics-csv", str(Path(output_dir) / f"{label}_metrics.csv"),
+            "--episodes", str(int(episodes)),
+            "--seed", str(int(seed)),
+            "--no-prediction", "--no-fuzzy-weights",
+        ]
+        if max_episode_tasks is not None:
+            args += ["--max-episode-tasks", str(int(max_episode_tasks))]
+        call(args)
 
 
 def maybe_train_predictor(kind: str, scenario_config: str, force: bool = False, epochs: int | None = None) -> Path:
@@ -106,14 +111,16 @@ def maybe_train_predictor(kind: str, scenario_config: str, force: bool = False, 
         raise ValueError(f"unknown predictor kind: {kind}")
     if epochs is not None:
         args += ["--epochs", str(int(epochs))]
+    if force:
+        args.append("--rebuild-cache")
     call(args)
     return best_checkpoint
 
 
-def train_drl_method(method: str, scenario_config: str, output_dir: str, total_timesteps: int, max_episode_tasks: int | None, force: bool = False) -> Path:
+def train_drl_method(method: str, scenario_config: str, output_dir: str, total_timesteps: int, max_episode_tasks: int | None, force: bool = False, time_budget_hours: float | None = None) -> Path:
     spec = DRL_METHODS[method]
     checkpoint = checkpoint_for(method, scenario_config)
-    if checkpoint.exists() and not force:
+    if checkpoint.exists() and best_checkpoint_for(method, scenario_config).exists() and not force:
         return checkpoint
     args = [
         sys.executable,
@@ -123,6 +130,8 @@ def train_drl_method(method: str, scenario_config: str, output_dir: str, total_t
         scenario_config,
         "--checkpoint-path",
         str(checkpoint),
+        "--best-checkpoint-path",
+        str(best_checkpoint_for(method, scenario_config)),
         "--log-path",
         str(Path(output_dir) / f"{method}_train_log.csv"),
         "--result-path",
@@ -132,6 +141,8 @@ def train_drl_method(method: str, scenario_config: str, output_dir: str, total_t
     ]
     if max_episode_tasks is not None:
         args += ["--max-episode-tasks", str(int(max_episode_tasks))]
+    if time_budget_hours is not None:
+        args += ["--time-budget-hours", str(float(time_budget_hours))]
     predictor_type = spec.get("predictor_type")
     if predictor_type:
         args += ["--predictor-type", predictor_type]
@@ -145,10 +156,9 @@ def train_drl_method(method: str, scenario_config: str, output_dir: str, total_t
 
 def evaluate_drl_method(method: str, scenario_config: str, output_dir: str, episodes: int, max_episode_tasks: int | None) -> None:
     spec = DRL_METHODS[method]
-    checkpoint = checkpoint_for(method, scenario_config)
+    checkpoint = best_checkpoint_for(method, scenario_config)
     if not checkpoint.exists():
-        print(f"SKIP {method}: checkpoint does not exist: {checkpoint}")
-        return
+        raise FileNotFoundError(f"required best PPO checkpoint does not exist: {checkpoint}")
     args = [
         sys.executable,
         "-m",

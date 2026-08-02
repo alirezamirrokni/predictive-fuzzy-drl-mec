@@ -60,7 +60,12 @@ class PPOCheckpoint:
     metadata: Dict[str, object]
 
 
-def save_ppo_checkpoint(path: str | Path, model: ActorCritic, metadata: Dict[str, object]) -> None:
+def save_ppo_checkpoint(
+    path: str | Path,
+    model: ActorCritic,
+    metadata: Dict[str, object],
+    optimizer: torch.optim.Optimizer | None = None,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -71,6 +76,7 @@ def save_ppo_checkpoint(path: str | Path, model: ActorCritic, metadata: Dict[str
                 "hidden_size": int(model.config.hidden_size),
             },
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": None if optimizer is None else optimizer.state_dict(),
             "metadata": metadata,
         },
         path,
@@ -115,7 +121,8 @@ class RolloutBuffer:
                 next_nonterminal = 1.0 - self.dones[step]
                 next_value = last_value
             else:
-                next_nonterminal = 1.0 - self.dones[step + 1]
+                # dones[t] describes the transition from state t to state t+1.
+                next_nonterminal = 1.0 - self.dones[step]
                 next_value = self.values[step + 1]
             delta = self.rewards[step] + gamma * next_value * next_nonterminal - self.values[step]
             last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae

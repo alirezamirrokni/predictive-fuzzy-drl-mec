@@ -12,19 +12,12 @@ from mec.task import Task
 
 @dataclass(slots=True)
 class RewardConfig:
-    latency_normalizer: float = 10.0
-    energy_normalizer: float = 10.0
+    success_alpha: float = 1.0
+    energy_beta: float = 2.0
     deadline_penalty: float = 1.0
     failure_penalty: float = 1.0
-    battery_penalty: float = 0.5
-    channel_penalty: float = 0.5
-    server_penalty: float = 0.5
+    reliability_target_penalty: float = 0.5
     reward_clip: float = 10.0
-    use_static_weights: bool = False
-    static_energy_weight: float = 0.25
-    static_latency_weight: float = 0.25
-    static_success_weight: float = 0.25
-    static_reliability_weight: float = 0.25
 
     @classmethod
     def from_dict(cls, data: Dict[str, object] | None) -> "RewardConfig":
@@ -40,52 +33,33 @@ class MECRewardFunction:
         self.config = RewardConfig() if config is None else config
 
     def weights_for(self, task: Task, device: IoTDevice, candidate_servers: Iterable[EdgeServer], prediction_uncertainty: float = 0.0) -> FuzzyWeights:
-        if self.config.use_static_weights:
-            return FuzzyWeights(
-                energy=float(self.config.static_energy_weight),
-                latency=float(self.config.static_latency_weight),
-                success=float(self.config.static_success_weight),
-                reliability=float(self.config.static_reliability_weight),
-            ).normalized()
         return self.fuzzy_controller.compute_from_task_context(task, device, candidate_servers, prediction_uncertainty)
 
-    def compute(
-        self,
-        outcome: SimulationOutcome,
-        task: Task,
-        device: IoTDevice,
-        candidate_servers: Iterable[EdgeServer],
-        prediction_uncertainty: float = 0.0,
-    ) -> tuple[float, Dict[str, float]]:
-        weights = self.weights_for(task, device, candidate_servers, prediction_uncertainty)
-        weight_dict = weights.to_dict()
-        latency = min(5.0, outcome.latency_s / max(task.deadline_s, self.config.latency_normalizer, 1e-9))
-        energy = min(5.0, outcome.energy_j / max(self.config.energy_normalizer, 1e-9))
+    def compute(self, outcome: SimulationOutcome, task: Task, device: IoTDevice, candidate_servers: Iterable[EdgeServer], prediction_uncertainty: float = 0.0):
+        weights = self.weights_for(task, device, candidate_servers, prediction_uncertainty).to_dict()
+        latency_term = min(5.0, outcome.latency_s / max(task.deadline_s, 1e-9))
+        local_reference = device.compute_power_w * task.cpu_cycles_mi / max(device.cpu_capacity_mips, 1e-9)
+        energy_term = min(5.0, outcome.energy_j / max(local_reference, 1e-9))
         reward = (
-            weight_dict["success"] * float(outcome.success)
-            + weight_dict["reliability"] * float(outcome.reliability)
-            - weight_dict["latency"] * latency
-            - weight_dict["energy"] * energy
+            self.config.success_alpha * weights["success"] * float(outcome.success)
+            + weights["reliability"] * float(outcome.reliability)
+            - weights["latency"] * latency_term
+            - self.config.energy_beta * weights["energy"] * energy_term
         )
         if outcome.deadline_violation:
             reward -= self.config.deadline_penalty
         if not outcome.success:
             reward -= self.config.failure_penalty
-        if outcome.failed_due_to_battery:
-            reward -= self.config.battery_penalty
-        if outcome.failed_due_to_channel:
-            reward -= self.config.channel_penalty
-        if outcome.failed_due_to_server:
-            reward -= self.config.server_penalty
+        if not outcome.reliability_satisfied:
+            reward -= self.config.reliability_target_penalty
         clip = abs(float(self.config.reward_clip))
         reward = max(-clip, min(clip, float(reward)))
-        info = {
+        return reward, {
             "reward": reward,
-            "latency_term": latency,
-            "energy_term": energy,
-            "weight_energy": weight_dict["energy"],
-            "weight_latency": weight_dict["latency"],
-            "weight_success": weight_dict["success"],
-            "weight_reliability": weight_dict["reliability"],
+            "latency_term": latency_term,
+            "energy_term": energy_term,
+            "weight_energy": weights["energy"],
+            "weight_latency": weights["latency"],
+            "weight_success": weights["success"],
+            "weight_reliability": weights["reliability"],
         }
-        return reward, info
